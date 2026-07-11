@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# superset-resume — control the Superset agent-session auto-resume-after-restart hook.
+#
+#   superset-resume on        Arm auto-resume. After your NEXT Mac restart, each restored
+#                             Superset pane resumes the exact conversation it had, staggered.
+#   superset-resume off       Disarm (default). Panes come back as plain shells.
+#   superset-resume status    Show armed state + how many panes would resume right now.
+#   superset-resume plan      Dry-run: print the exact resume plan (pane -> workspace ->
+#                             conversation), changing nothing.
+#   superset-resume self-test After a reboot: verify THIS restored pane's id still maps to a
+#                             real, on-disk conversation, WITHOUT resuming.
+#
+# Note: the auto-resume hook is zsh-only (macOS default). Bash panes won't auto-resume.
+set -euo pipefail
+RECOV="$HOME/.superset-recovery"
+LIB="$RECOV/resume-lib.py"
+ARMED="$RECOV/armed"
+
+case "${1:-status}" in
+  on)
+    if [[ "$(python3 "$LIB" native 2>/dev/null || echo 0)" == 1 ]]; then
+      echo "ℹ️  Superset resumes agent sessions natively now (superset-sh/superset#5246 shipped)."
+      echo "   No need to arm this tool — native handles it. You can remove ~/.superset-recovery"
+      echo "   and the ~/.zshrc block. Not arming."; exit 0
+    fi
+    # prune stale-boot lock/slot state so a prior boot can't block this one; rotate a big log
+    bid="$(python3 "$LIB" bootid 2>/dev/null || true)"
+    if [[ -n "$bid" ]]; then
+      find "$RECOV/locks" "$RECOV/slots" -mindepth 1 -maxdepth 1 -type d ! -name "$bid" -exec rm -rf {} + 2>/dev/null || true
+    fi
+    if [[ -f "$RECOV/resume.log" && "$(wc -c < "$RECOV/resume.log" 2>/dev/null || echo 0)" -gt 1000000 ]]; then
+      : > "$RECOV/resume.log"
+    fi
+    touch "$ARMED"
+    echo "✅ Auto-resume ARMED."
+    echo "   After your next Mac restart, reopen Superset and each restored pane resumes"
+    echo "   its conversation automatically (staggered ~6s apart). Disarm: superset-resume off"
+    ;;
+  off)
+    rm -f "$ARMED"
+    echo "⏸  Auto-resume DISARMED. Restored panes stay plain shells (default)."
+    ;;
+  status)
+    if [[ "$(python3 "$LIB" native 2>/dev/null || echo 0)" == 1 ]]; then
+      echo "⚠️  Superset native cold-restore resume detected — this tool stands down automatically."
+      echo "   Native handles resume now; safe to remove ~/.superset-recovery + the ~/.zshrc block."
+      echo
+    fi
+    if [[ -f "$ARMED" ]]; then echo "state: ARMED (will resume after next restart)"; else echo "state: disarmed (default)"; fi
+    echo
+    python3 "$LIB" plan
+    ;;
+  plan|dry-run)
+    python3 "$LIB" plan
+    ;;
+  self-test)
+    if [[ -z "${SUPERSET_TERMINAL_ID:-}" ]]; then
+      echo "Run this inside a Superset pane (SUPERSET_TERMINAL_ID not set here)."; exit 1
+    fi
+    r="$(python3 "$LIB" resolve "$SUPERSET_TERMINAL_ID" "${SUPERSET_WORKSPACE_ID:-}" 2>/dev/null || true)"
+    if [[ -n "$r" ]]; then
+      agent="${r%%$'\t'*}"; sid="${r##*$'\t'}"
+      echo "✅ This pane's id survived the restart and maps to a real, on-disk conversation:"
+      echo "     $agent  $sid"
+      echo "   (arming would resume exactly this here — nothing was resumed now)"
+    else
+      echo "ℹ️  Nothing to resume for THIS pane (new pane, non-agent shell, workspace mismatch,"
+      echo "   or its worktree/transcript is gone). Safe no-op."
+    fi
+    ;;
+  *)
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+esac
