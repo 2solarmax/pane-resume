@@ -23,7 +23,7 @@ if [[ -o interactive ]] \
    && [[ -f "$HOME/.superset-recovery/armed" ]]; then
   () {
     emulate -L zsh
-    local recov="$HOME/.superset-recovery" lib log plan agent sid bootid lockroot slot
+    local recov="$HOME/.superset-recovery" lib log plan agent sid bootid lockroot lockdir slot
     local -a parts base
     lib="$recov/resume-lib.py"; log="$recov/resume.log"
     [[ -f "$lib" ]] || return 0
@@ -58,14 +58,37 @@ if [[ -o interactive ]] \
     command find "$recov/locks" "$recov/slots" -mindepth 1 -maxdepth 1 -type d ! -name "$bootid" -exec rm -rf {} + 2>/dev/null
     lockroot="$recov/locks/$bootid"
     command mkdir -p "$lockroot" 2>/dev/null || return 0
-    command mkdir "$lockroot/$SUPERSET_TERMINAL_ID" 2>/dev/null || return 0   # atomic one-shot
+    lockdir="$lockroot/$SUPERSET_TERMINAL_ID"
+    # Reclaim a STALE one-shot lock before claiming. A prior shell for THIS pane that
+    # committed the lock then was killed mid-stagger (before it ever launched) never
+    # released it -> without this, reopening the pane is silently burned for the rest of
+    # the boot (the exact "sessions don't get restarted" symptom). Reclaim ONLY when the
+    # owner PID is POSITIVELY dead (present in the pid file AND not alive) AND it never
+    # reached launch (no `exec` marker) AND no agent is running in the pane. An ABSENT/empty
+    # pid is deliberately NOT reclaimable: it's either a legacy lock from before this fix
+    # (that pane already resumed -> never re-resume it) or a lock claimed microseconds ago
+    # whose owner hasn't written its pid yet (protect it). Fails safe: worst case an owner
+    # killed in that microsecond window stays burned (rare), never a double-resume.
+    if [[ -d "$lockdir" && ! -e "$lockdir/exec" ]]; then
+      local lpid="$(command cat "$lockdir/pid" 2>/dev/null)"
+      if [[ -n "$lpid" ]] && ! command kill -0 "$lpid" 2>/dev/null \
+         && [[ "$(command python3 "$lib" agent-running "$SUPERSET_TERMINAL_ID" 2>/dev/null)" != 1 ]]; then
+        command rm -rf "$lockdir" 2>/dev/null
+        print -r -- "$(command date '+%F %T') reclaimed stale lock (owner $lpid dead, no agent) term=$SUPERSET_TERMINAL_ID" >> "$log" 2>/dev/null
+      fi
+    fi
+    command mkdir "$lockdir" 2>/dev/null || return 0   # atomic one-shot
+    print -r -- "$$" > "$lockdir/pid" 2>/dev/null      # owner PID -> stale-lock reclaim above
     export _SUPERSET_RESUME_DONE=1
     print -r -- "$(command date '+%F %T') FIRED term=$SUPERSET_TERMINAL_ID ws=$SUPERSET_WORKSPACE_ID agent=$agent sid=$sid" >> "$log" 2>/dev/null
 
-    # 3) Stagger to avoid a thundering herd of heavy resumes (slot is atomically unique).
+    # 3) Stagger to avoid a thundering herd of heavy resumes. `slot` is now this pane's
+    #    position within the CURRENT burst (resume-lib.slot): a pane opened alone gets 0
+    #    (no wait, instant), a simultaneous batch gets 0,6,12,... Cap at 8 so even a large
+    #    batch never waits > 48s (and a later-opened tab is never stuck for minutes).
     slot="$(command python3 "$lib" slot 2>/dev/null)"
     if [[ -n "$slot" && "$slot" == <-> && "$slot" -gt 0 ]]; then
-      local wait=$(( slot * 6 ))
+      local wait=$(( (slot > 8 ? 8 : slot) * 6 ))
       print -Pn "%F{cyan}▶ superset-recovery: resuming ${agent} %f"; print -rn -- "${sid[1,8]}…"; print -P "%F{cyan} in ${wait}s (staggered)%f"
       command sleep "$wait"
     else
@@ -91,15 +114,16 @@ if [[ -o interactive ]] \
       print -r -- "$(command date '+%F %T')   -> $agent not found; left as shell" >> "$log" 2>/dev/null
       return 0
     fi
+    command : > "$lockdir/exec" 2>/dev/null   # mark: reached launch -> one-shot honored, NOT reclaimable
     print -r -- "$(command date '+%F %T')   -> exec: $base[*]" >> "$log" 2>/dev/null
     "$base[@]"
     local rc=$?
-    # If the launcher never started the agent (e.g. a wrapper needs a backend/creds
-    # not ready this early after a cold restart), it exits non-zero and the pane is a
-    # bare shell. Release the one-shot lock so simply re-opening that pane retries the
+    # If the launcher never started the agent (e.g. a wrapper needs a backend/creds not
+    # ready this early after a cold restart), it exits non-zero and the pane is a bare
+    # shell. Release the whole one-shot lock so simply re-opening that pane retries the
     # resume (env is up by then) instead of permanently burning it for this boot.
     if (( rc != 0 )); then
-      command rmdir "$lockroot/$SUPERSET_TERMINAL_ID" 2>/dev/null
+      command rm -rf "$lockdir" 2>/dev/null
       print -r -- "$(command date '+%F %T')   -> launcher exit rc=$rc; released for retry" >> "$log" 2>/dev/null
     fi
     return 0

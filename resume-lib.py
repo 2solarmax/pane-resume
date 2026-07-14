@@ -269,25 +269,59 @@ def plan():
         print(f"   {_norm_agent(agent_id):<7} {sid[:8]}…  {('- ' + _label(sid)) if _label(sid) else ''}")
 
 
+_STAGGER_WINDOW = 45.0  # seconds: resumes within this window of each other are one "burst"
+
 def slot():
-    """Atomically-unique stagger index for this boot. O_EXCL create-the-index means
-    concurrently-firing panes (a reboot fires them all at once) each get a DISTINCT
-    slot -> distinct sleep -> real staggering (no thundering-herd collapse)."""
+    """Stagger position within the CURRENT resume BURST — NOT a lifetime per-boot count.
+
+    A "burst" = panes whose slot markers were created within _STAGGER_WINDOW seconds of
+    each other (a split of many panes mounting at once, or the post-restart rush). Returns
+    how many earlier-claimed markers are still inside that window:
+      - a pane opened ALONE after a lull   -> 0 -> the hook does NOT sleep -> instant resume
+      - the k-th pane of a simultaneous batch -> k -> staggered (herd protection preserved)
+
+    Fixes the prior monotonic-index bug where the N-th pane EVER resumed this boot waited
+    N*STEP s (minutes, growing unbounded with uptime), so a tab opened hours later appeared
+    to never resume. Markers from earlier bursts this boot have old mtimes and fall outside
+    the window, so they never inflate the count. Any error -> 0 (fail to immediate-resume,
+    never to a long stall)."""
     bid = boot_id()
     if not bid:
         print(0); return   # unknown boot -> don't stagger (never share a constant bucket)
     d = os.path.join(RECOV, "slots", bid)
     try:
         os.makedirs(d, exist_ok=True)
-        i = 0
-        while i < 100000:
+        # Claim a unique, increasing index atomically (distinctness within a burst).
+        i, mine = 0, None
+        while i < 1000000:
+            p = os.path.join(d, str(i))
             try:
-                fd = os.open(os.path.join(d, str(i)), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-                os.close(fd)
-                print(i); return
+                fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                os.close(fd); mine = (i, p); break
             except FileExistsError:
                 i += 1
-        print(0)
+        if mine is None:
+            print(0); return
+        my_idx, my_path = mine
+        try:
+            now = os.stat(my_path).st_mtime
+        except OSError:
+            now = 0.0
+        # position = count of earlier-claimed markers still within the burst window
+        pos = 0
+        for name in os.listdir(d):
+            if not name.isdigit():
+                continue
+            idx = int(name)
+            if idx >= my_idx:
+                continue
+            try:
+                m = os.stat(os.path.join(d, name)).st_mtime
+            except OSError:
+                continue
+            if 0.0 <= (now - m) <= _STAGGER_WINDOW:
+                pos += 1
+        print(pos)
     except Exception:
         print(0)
 
