@@ -9,12 +9,11 @@ that survives a cold restart) -> workspace_id -> agent_session_id. So we can loo
 exactly which conversation each restored pane had and resume it.
 
 Read-only brain: integrity/existence-checked, workspace-verified, busy-retrying
-host.db lookups + atomic staggering. NEVER writes host.db, NEVER resumes on its own.
+host.db lookups. NEVER writes host.db, NEVER resumes on its own.
 
 Commands:
   resolve <terminal_id> <workspace_id>  -> "<agent>\\t<session_id>" (verified) or ""
   plan                                  -> human table of what WOULD resume (dry-run)
-  slot                                  -> atomically-unique stagger slot for THIS boot
   bootid                                -> stable id of the current boot ("" if unknown)
 """
 import sys, os, glob, sqlite3, subprocess, re, time, json
@@ -42,7 +41,7 @@ def host_db():
 
 
 def boot_id():
-    """Stable per-boot id; distinct across boots so stale locks/slots can't block
+    """Stable per-boot id; distinct across boots so stale locks can't block
     a later boot. Empty string on total failure (caller then skips locking)."""
     try:
         out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True).stdout
@@ -269,63 +268,6 @@ def plan():
         print(f"   {_norm_agent(agent_id):<7} {sid[:8]}…  {('- ' + _label(sid)) if _label(sid) else ''}")
 
 
-_STAGGER_WINDOW = 45.0  # seconds: resumes within this window of each other are one "burst"
-
-def slot():
-    """Stagger position within the CURRENT resume BURST — NOT a lifetime per-boot count.
-
-    A "burst" = panes whose slot markers were created within _STAGGER_WINDOW seconds of
-    each other (a split of many panes mounting at once, or the post-restart rush). Returns
-    how many earlier-claimed markers are still inside that window:
-      - a pane opened ALONE after a lull   -> 0 -> the hook does NOT sleep -> instant resume
-      - the k-th pane of a simultaneous batch -> k -> staggered (herd protection preserved)
-
-    Fixes the prior monotonic-index bug where the N-th pane EVER resumed this boot waited
-    N*STEP s (minutes, growing unbounded with uptime), so a tab opened hours later appeared
-    to never resume. Markers from earlier bursts this boot have old mtimes and fall outside
-    the window, so they never inflate the count. Any error -> 0 (fail to immediate-resume,
-    never to a long stall)."""
-    bid = boot_id()
-    if not bid:
-        print(0); return   # unknown boot -> don't stagger (never share a constant bucket)
-    d = os.path.join(RECOV, "slots", bid)
-    try:
-        os.makedirs(d, exist_ok=True)
-        # Claim a unique, increasing index atomically (distinctness within a burst).
-        i, mine = 0, None
-        while i < 1000000:
-            p = os.path.join(d, str(i))
-            try:
-                fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-                os.close(fd); mine = (i, p); break
-            except FileExistsError:
-                i += 1
-        if mine is None:
-            print(0); return
-        my_idx, my_path = mine
-        try:
-            now = os.stat(my_path).st_mtime
-        except OSError:
-            now = 0.0
-        # position = count of earlier-claimed markers still within the burst window
-        pos = 0
-        for name in os.listdir(d):
-            if not name.isdigit():
-                continue
-            idx = int(name)
-            if idx >= my_idx:
-                continue
-            try:
-                m = os.stat(os.path.join(d, name)).st_mtime
-            except OSError:
-                continue
-            if 0.0 <= (now - m) <= _STAGGER_WINDOW:
-                pos += 1
-        print(pos)
-    except Exception:
-        print(0)
-
-
 # --- migration / de-dup: stand down once Superset ships native auto-resume ---
 # v1.13.0 terminal_sessions columns. When Superset's native cold-restore auto-resume
 # (superset-sh/superset#5246) ships, it EXTENDS terminal_sessions with restore/command
@@ -378,8 +320,6 @@ if __name__ == "__main__":
         print(resolve(sys.argv[2], sys.argv[3]))
     elif cmd == "plan":
         plan()
-    elif cmd == "slot":
-        slot()
     elif cmd == "bootid":
         print(boot_id())
     elif cmd == "native":

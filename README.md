@@ -19,7 +19,7 @@ A tiny `zsh` hook (sourced from your `~/.zshrc`) runs when a restored pane's she
 1. looks up *this* pane's prior session in `host.db` (workspace-verified),
 2. confirms the worktree + transcript still exist,
 3. rebuilds the launcher you actually start that agent with (preserving your flags/wrapper),
-4. resumes it — **staggered** so 20-40 panes don't spike your CPU/API at once.
+4. resumes it **immediately** — no artificial delay. (Earlier versions staggered resumes to protect against a "thundering herd"; in practice the deliberate sleep froze panes for minutes while dozens of concurrent agent sessions run side-by-side without issue, so staggering was removed.)
 
 Every agent CLI already persists its own conversation (`~/.claude/projects/…`, `~/.codex/sessions/…`), so "resume" just re-attaches the agent to its transcript.
 
@@ -55,7 +55,7 @@ Designed to be a no-op in every normal case and to never break your shell or for
 - **Opt-in** (disarmed by default) and **one-shot per pane per boot** (atomic lock).
 - Guards: interactive-only, skips inside Claude (`CLAUDECODE`), UUID-validates the pane id (no path traversal), workspace-verified lookup (won't wake an agent in the wrong repo), `PRAGMA quick_check` on the DB, and existence checks (a pruned worktree/transcript → safe no-op, not a fresh session).
 - The agent runs as a **child**, so a stale/failed resume falls back to a shell instead of killing the pane; a launcher that can't start (e.g. a wrapper needing creds not ready at boot) **releases the lock so a re-open retries**.
-- **Staggered** resumes to avoid a thundering-herd freeze.
+- **Type-ahead drain**: Superset re-sends the pane's preset command text on restore; the hook drains that pending tty input right before launching, so it isn't delivered into the resumed agent as junk prompt input (and can't fire a surprise duplicate launch after the agent exits).
 
 ## Migration
 

@@ -23,7 +23,7 @@ if [[ -o interactive ]] \
    && [[ -f "$HOME/.superset-recovery/armed" ]]; then
   () {
     emulate -L zsh
-    local recov="$HOME/.superset-recovery" lib log plan agent sid bootid lockroot lockdir slot
+    local recov="$HOME/.superset-recovery" lib log plan agent sid bootid lockroot lockdir
     local -a parts base
     lib="$recov/resume-lib.py"; log="$recov/resume.log"
     [[ -f "$lib" ]] || return 0
@@ -54,13 +54,15 @@ if [[ -o interactive ]] \
     # 2) Only now commit the one-shot guards (this pane WILL resume).
     bootid="$(command python3 "$lib" bootid 2>/dev/null)"
     [[ -n "$bootid" ]] || return 0
-    # opportunistically reap other-boot lock/slot dirs (bounded on-disk state)
-    command find "$recov/locks" "$recov/slots" -mindepth 1 -maxdepth 1 -type d ! -name "$bootid" -exec rm -rf {} + 2>/dev/null
+    # opportunistically reap other-boot lock dirs (bounded on-disk state); slots/ is
+    # legacy stagger state (removed 2026-07-14) — clear it entirely if still present
+    command find "$recov/locks" -mindepth 1 -maxdepth 1 -type d ! -name "$bootid" -exec rm -rf {} + 2>/dev/null
+    command rm -rf "$recov/slots" 2>/dev/null
     lockroot="$recov/locks/$bootid"
     command mkdir -p "$lockroot" 2>/dev/null || return 0
     lockdir="$lockroot/$SUPERSET_TERMINAL_ID"
     # Reclaim a STALE one-shot lock before claiming. A prior shell for THIS pane that
-    # committed the lock then was killed mid-stagger (before it ever launched) never
+    # committed the lock then was killed before it ever launched never
     # released it -> without this, reopening the pane is silently burned for the rest of
     # the boot (the exact "sessions don't get restarted" symptom). Reclaim ONLY when the
     # owner PID is POSITIVELY dead (present in the pid file AND not alive) AND it never
@@ -82,18 +84,11 @@ if [[ -o interactive ]] \
     export _SUPERSET_RESUME_DONE=1
     print -r -- "$(command date '+%F %T') FIRED term=$SUPERSET_TERMINAL_ID ws=$SUPERSET_WORKSPACE_ID agent=$agent sid=$sid" >> "$log" 2>/dev/null
 
-    # 3) Stagger to avoid a thundering herd of heavy resumes. `slot` is now this pane's
-    #    position within the CURRENT burst (resume-lib.slot): a pane opened alone gets 0
-    #    (no wait, instant), a simultaneous batch gets 0,6,12,... Cap at 8 so even a large
-    #    batch never waits > 48s (and a later-opened tab is never stuck for minutes).
-    slot="$(command python3 "$lib" slot 2>/dev/null)"
-    if [[ -n "$slot" && "$slot" == <-> && "$slot" -gt 0 ]]; then
-      local wait=$(( (slot > 8 ? 8 : slot) * 6 ))
-      print -Pn "%F{cyan}▶ superset-recovery: resuming ${agent} %f"; print -rn -- "${sid[1,8]}…"; print -P "%F{cyan} in ${wait}s (staggered)%f"
-      command sleep "$wait"
-    else
-      print -Pn "%F{cyan}▶ superset-recovery: resuming ${agent} %f"; print -r -- "${sid[1,8]}…"
-    fi
+    # 3) Announce and resume IMMEDIATELY — no stagger. The deliberate delay proved worse
+    #    than the thundering herd it guarded against (2026-07-14: panes frozen for
+    #    minutes waiting on their slot); a full-workspace batch of concurrent resumes
+    #    is fine on modern hardware, and dozens of live agents run side-by-side anyway.
+    print -Pn "%F{cyan}▶ superset-recovery: resuming ${agent} %f"; print -r -- "${sid[1,8]}…"
 
     # 4) Rebuild the launcher (parts[3..] = the user's preset command+args, e.g.
     #    `cc all --dangerously-skip-permissions`) or fall back to the bare agent;
@@ -115,6 +110,14 @@ if [[ -o interactive ]] \
       return 0
     fi
     command : > "$lockdir/exec" 2>/dev/null   # mark: reached launch -> one-shot honored, NOT reclaimable
+    # Drain tty type-ahead before handing the pane to the agent. Superset re-sends the
+    # pane's preset command text on restore; while zshrc runs it sits unread in the tty
+    # buffer and would otherwise be delivered INTO the resumed agent as junk prompt input
+    # (or execute as a surprise duplicate launch after the agent exits). Non-blocking
+    # (-t with no num = only if input is already pending), silent, bounded.
+    local -i _drained=0
+    while (( _drained < 4096 )) && read -s -t -k 1 2>/dev/null; do (( _drained++ )); done
+    (( _drained )) && print -r -- "$(command date '+%F %T')   -> drained ${_drained} type-ahead char(s)" >> "$log" 2>/dev/null
     print -r -- "$(command date '+%F %T')   -> exec: $base[*]" >> "$log" 2>/dev/null
     "$base[@]"
     local rc=$?

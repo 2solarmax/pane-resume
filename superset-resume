@@ -2,7 +2,7 @@
 # superset-resume — control the Superset agent-session auto-resume-after-restart hook.
 #
 #   superset-resume on        Arm auto-resume. After your NEXT Mac restart, each restored
-#                             Superset pane resumes the exact conversation it had, staggered.
+#                             Superset pane resumes the exact conversation it had.
 #   superset-resume off       Disarm (default). Panes come back as plain shells.
 #   superset-resume status    Show armed state + how many panes would resume right now.
 #   superset-resume plan      Dry-run: print the exact resume plan (pane -> workspace ->
@@ -23,18 +23,19 @@ case "${1:-status}" in
       echo "   No need to arm this tool — native handles it. You can remove ~/.superset-recovery"
       echo "   and the ~/.zshrc block. Not arming."; exit 0
     fi
-    # prune stale-boot lock/slot state so a prior boot can't block this one; rotate a big log
+    # prune stale-boot lock state so a prior boot can't block this one; rotate a big log
     bid="$(python3 "$LIB" bootid 2>/dev/null || true)"
     if [[ -n "$bid" ]]; then
-      find "$RECOV/locks" "$RECOV/slots" -mindepth 1 -maxdepth 1 -type d ! -name "$bid" -exec rm -rf {} + 2>/dev/null || true
+      find "$RECOV/locks" -mindepth 1 -maxdepth 1 -type d ! -name "$bid" -exec rm -rf {} + 2>/dev/null || true
     fi
+    rm -rf "$RECOV/slots" 2>/dev/null || true   # legacy stagger state (removed 2026-07-14)
     if [[ -f "$RECOV/resume.log" && "$(wc -c < "$RECOV/resume.log" 2>/dev/null || echo 0)" -gt 1000000 ]]; then
       : > "$RECOV/resume.log"
     fi
     touch "$ARMED"
     echo "✅ Auto-resume ARMED."
     echo "   After your next Mac restart, reopen Superset and each restored pane resumes"
-    echo "   its conversation automatically (staggered ~6s apart). Disarm: superset-resume off"
+    echo "   its conversation automatically. Disarm: superset-resume off"
     ;;
   off)
     rm -f "$ARMED"
