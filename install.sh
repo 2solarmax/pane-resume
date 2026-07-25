@@ -12,8 +12,9 @@ END="# <<< superset-recovery <<<"
 
 echo "Installing superset-session-resume → $DEST"
 mkdir -p "$DEST"
-cp "$SRC/resume-lib.py" "$SRC/resume-hook.zsh" "$SRC/superset-resume" "$DEST/"
-chmod +x "$DEST/superset-resume" "$DEST/resume-lib.py"
+cp "$SRC/resume-lib.py" "$SRC/resume-hook.zsh" "$SRC/superset-resume" \
+   "$SRC/warp-session-hook.py" "$DEST/"
+chmod +x "$DEST/superset-resume" "$DEST/resume-lib.py" "$DEST/warp-session-hook.py"
 
 # Wire ~/.zshrc (idempotent: replace an existing managed block, else append).
 BLOCK="$BEGIN
@@ -37,6 +38,10 @@ else
   echo "Added block to ~/.zshrc."
 fi
 
+echo
+echo "For WARP: also register the session-binding hook in ~/.claude/settings.json"
+echo "  (append a SessionStart + SessionEnd group running:"
+echo "   python3 ~/.superset-recovery/warp-session-hook.py) — see README."
 echo
 echo "Done. It's installed but DISARMED (opt-in)."
 echo "  superset-resume plan     # see what would resume"

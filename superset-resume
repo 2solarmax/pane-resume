@@ -1,40 +1,58 @@
 #!/usr/bin/env bash
-# superset-resume — control the Superset agent-session auto-resume-after-restart hook.
+# superset-resume — control the agent-session auto-resume-after-restart hook.
+# Supports BOTH terminals: Superset (cold-restore, via host.db) and Warp (session
+# restoration, via a per-pane binding our Claude SessionStart/SessionEnd hooks maintain).
 #
 #   superset-resume on        Arm auto-resume. After your NEXT Mac restart, each restored
-#                             Superset pane resumes the exact conversation it had.
+#                             pane resumes the exact conversation it had. (Also seeds
+#                             bindings for claude sessions already running in Warp.)
 #   superset-resume off       Disarm (default). Panes come back as plain shells.
-#   superset-resume status    Show armed state + how many panes would resume right now.
-#   superset-resume plan      Dry-run: print the exact resume plan (pane -> workspace ->
-#                             conversation), changing nothing.
-#   superset-resume self-test After a reboot: verify THIS restored pane's id still maps to a
-#                             real, on-disk conversation, WITHOUT resuming.
+#   superset-resume status    Show armed state + what would resume right now.
+#   superset-resume plan      Dry-run: print the exact resume plan, changing nothing.
+#   superset-resume self-test Verify THIS pane maps to a real, on-disk conversation, WITHOUT
+#                             resuming (works in a Superset or a Warp pane).
 #
 # Note: the auto-resume hook is zsh-only (macOS default). Bash panes won't auto-resume.
+# In Warp, only claude sessions are supported (codex/gemini: coming).
 set -euo pipefail
 RECOV="$HOME/.superset-recovery"
 LIB="$RECOV/resume-lib.py"
 ARMED="$RECOV/armed"
 
+in_warp() { [[ "${TERM_PROGRAM:-}" == "WarpTerminal" && -n "${WARP_TERMINAL_SESSION_UUID:-}" ]]; }
+has_superset() { [[ -n "${SUPERSET_TERMINAL_ID:-}" ]] || compgen -G "$HOME/.superset/host/*/host.db" >/dev/null 2>&1; }
+
+show_plans() {
+  local shown=0
+  if compgen -G "$HOME/.superset/host/*/host.db" >/dev/null 2>&1; then
+    echo "── Superset ──"; python3 "$LIB" plan; shown=1
+  fi
+  if in_warp || [[ -d "$RECOV/warp-bindings" && -n "$(ls -A "$RECOV/warp-bindings" 2>/dev/null)" ]]; then
+    [[ "$shown" == 1 ]] && echo; echo "── Warp ──"; python3 "$LIB" warp-plan; shown=1
+  fi
+  [[ "$shown" == 1 ]] || echo "No Superset host.db and no Warp bindings yet — nothing to resume."
+}
+
 case "${1:-status}" in
   on)
-    if [[ "$(python3 "$LIB" native 2>/dev/null || echo 0)" == 1 ]]; then
+    if has_superset && [[ "$(python3 "$LIB" native 2>/dev/null || echo 0)" == 1 ]]; then
       echo "ℹ️  Superset resumes agent sessions natively now (superset-sh/superset#5246 shipped)."
-      echo "   No need to arm this tool — native handles it. You can remove ~/.superset-recovery"
-      echo "   and the ~/.zshrc block. Not arming."; exit 0
+      echo "   No need to arm this tool — native handles it. Not arming."; exit 0
     fi
-    # prune stale-boot lock state so a prior boot can't block this one; rotate a big log
     bid="$(python3 "$LIB" bootid 2>/dev/null || true)"
     if [[ -n "$bid" ]]; then
       find "$RECOV/locks" -mindepth 1 -maxdepth 1 -type d ! -name "$bid" -exec rm -rf {} + 2>/dev/null || true
     fi
-    rm -rf "$RECOV/slots" 2>/dev/null || true   # legacy stagger state (removed 2026-07-14)
+    rm -rf "$RECOV/slots" 2>/dev/null || true
     if [[ -f "$RECOV/resume.log" && "$(wc -c < "$RECOV/resume.log" 2>/dev/null || echo 0)" -gt 1000000 ]]; then
       : > "$RECOV/resume.log"
     fi
+    python3 "$LIB" gc-warp >/dev/null 2>&1 || true          # sweep orphan bindings
+    seeded="$(python3 "$LIB" bootstrap-warp 2>/dev/null || echo 0)"  # seed already-running Warp sessions
     touch "$ARMED"
     echo "✅ Auto-resume ARMED."
-    echo "   After your next Mac restart, reopen Superset and each restored pane resumes"
+    [[ "${seeded:-0}" -gt 0 ]] && echo "   Seeded ${seeded} already-running Warp claude session(s)."
+    echo "   After your next Mac restart, reopen the terminal and each restored pane resumes"
     echo "   its conversation automatically. Disarm: superset-resume off"
     ;;
   off)
@@ -42,34 +60,41 @@ case "${1:-status}" in
     echo "⏸  Auto-resume DISARMED. Restored panes stay plain shells (default)."
     ;;
   status)
-    if [[ "$(python3 "$LIB" native 2>/dev/null || echo 0)" == 1 ]]; then
-      echo "⚠️  Superset native cold-restore resume detected — this tool stands down automatically."
-      echo "   Native handles resume now; safe to remove ~/.superset-recovery + the ~/.zshrc block."
-      echo
+    if has_superset && [[ "$(python3 "$LIB" native 2>/dev/null || echo 0)" == 1 ]]; then
+      echo "⚠️  Superset native cold-restore resume detected — this tool stands down automatically."; echo
     fi
     if [[ -f "$ARMED" ]]; then echo "state: ARMED (will resume after next restart)"; else echo "state: disarmed (default)"; fi
     echo
-    python3 "$LIB" plan
+    show_plans
     ;;
   plan|dry-run)
-    python3 "$LIB" plan
+    show_plans
+    ;;
+  bootstrap)
+    n="$(python3 "$LIB" bootstrap-warp 2>/dev/null || echo 0)"
+    echo "Seeded ${n} already-running Warp claude session(s) into bindings."
     ;;
   self-test)
-    if [[ -z "${SUPERSET_TERMINAL_ID:-}" ]]; then
-      echo "Run this inside a Superset pane (SUPERSET_TERMINAL_ID not set here)."; exit 1
+    if in_warp; then
+      r="$(python3 "$LIB" resolve-warp "$WARP_TERMINAL_SESSION_UUID" 2>/dev/null || true)"
+      ctx="Warp pane"
+    elif [[ -n "${SUPERSET_TERMINAL_ID:-}" ]]; then
+      r="$(python3 "$LIB" resolve "$SUPERSET_TERMINAL_ID" "${SUPERSET_WORKSPACE_ID:-}" 2>/dev/null || true)"
+      ctx="Superset pane"
+    else
+      echo "Run this inside a Superset or Warp pane (no pane id in env here)."; exit 1
     fi
-    r="$(python3 "$LIB" resolve "$SUPERSET_TERMINAL_ID" "${SUPERSET_WORKSPACE_ID:-}" 2>/dev/null || true)"
     if [[ -n "$r" ]]; then
-      agent="${r%%$'\t'*}"; sid="${r##*$'\t'}"
-      echo "✅ This pane's id survived the restart and maps to a real, on-disk conversation:"
+      agent="${r%%$'\t'*}"; sid="${r#*$'\t'}"; sid="${sid%%$'\t'*}"
+      echo "✅ This ${ctx}'s id maps to a real, on-disk conversation:"
       echo "     $agent  $sid"
       echo "   (arming would resume exactly this here — nothing was resumed now)"
     else
-      echo "ℹ️  Nothing to resume for THIS pane (new pane, non-agent shell, workspace mismatch,"
-      echo "   or its worktree/transcript is gone). Safe no-op."
+      echo "ℹ️  Nothing to resume for THIS pane (fresh pane, non-agent shell, cleanly-exited"
+      echo "   session, or its transcript is gone). Safe no-op."
     fi
     ;;
   *)
-    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 esac

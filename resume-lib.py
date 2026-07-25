@@ -21,7 +21,9 @@ import sys, os, glob, sqlite3, subprocess, re, time, json
 HOME = os.path.expanduser("~")
 RECOV = os.path.join(HOME, ".superset-recovery")
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
-UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")       # claude/superset ids: 36-char dashed UUID
+WARP_UUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")   # Warp pane id: 32 hex, no dashes
+WARP_BINDINGS = os.path.join(RECOV, "warp-bindings")
 
 
 def host_db():
@@ -296,8 +298,10 @@ def native_resume_present():
 
 def agent_running(term_id):
     """True if an agent process is already bound to this pane (native/manual already
-    resumed it) — the hook then skips, so it can't start a second."""
-    if not UUID_RE.match(term_id or ""):
+    resumed it) — the hook then skips, so it can't start a second. Matches BOTH the
+    Superset pane id (SUPERSET_TERMINAL_ID, 36-char dashed) and the Warp pane id
+    (WARP_TERMINAL_SESSION_UUID, 32 hex) so the dedup works in either terminal."""
+    if not (UUID_RE.match(term_id or "") or WARP_UUID_RE.match(term_id or "")):
         return False
     try:
         ps = subprocess.run(["ps", "-Ao", "pid=,command="], capture_output=True, text=True).stdout
@@ -309,17 +313,230 @@ def agent_running(term_id):
             m = re.search(r"SUPERSET_TERMINAL_ID=([0-9a-f-]{36})", env)
             if m and m.group(1) == term_id:
                 return True
+            mw = re.search(r"WARP_TERMINAL_SESSION_UUID=([0-9a-fA-F]{32})", env)
+            if mw and mw.group(1) == term_id:
+                return True
     except Exception:
         pass
     return False
+
+
+# --- Warp adapter (claude only, v1) ----------------------------------------
+# Warp restores tab/pane layout + working directory after a Mac restart but drops each
+# pane into an idle shell (running processes are NOT resumed — Warp docs; feature reqs
+# superset-sh: warpdotdev/warp#10583, #9416). Warp has no pane->agent-session record, so
+# we build our OWN exact binding: our Claude SessionStart hook writes warp-bindings/<pane
+# uuid> = "<cwd>\t<session_id>" while a session is LIVE in that pane, and the SessionEnd
+# hook removes it on clean exit. A reboot cuts the session off WITHOUT a SessionEnd, so a
+# leftover binding means exactly "this pane had a live claude session killed by the
+# restart" — resume that EXACT session (no cwd->newest guessing that would pile every pane
+# in a shared dir onto one session). Pane identity = WARP_TERMINAL_SESSION_UUID, which Warp
+# persists in terminal_panes and reuses on restore.
+
+def _warp_db():
+    """Path to Warp's session-restoration sqlite (Group Container). Glob the team-id
+    prefix so a different Warp build/team-id still resolves. None if not found."""
+    for p in glob.glob(os.path.join(
+            HOME, "Library", "Group Containers", "*.dev.warp",
+            "Library", "Application Support", "dev.warp.Warp-Stable", "warp.sqlite")):
+        return p
+    return None
+
+
+def _warp_pane_cwd(uuid):
+    """Best-effort live cwd Warp records for this pane (INDEXED uuid point-lookup —
+    terminal_panes.uuid is UNIQUE; never the unindexed 73MB blocks scan). immutable=1 =
+    no locks, reads the main db only, so it can NEVER disturb Warp's live DB. Any error
+    (db/table/column absent, busy) -> None -> caller degrades gracefully."""
+    db = _warp_db()
+    if not db:
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True, timeout=1.0)
+        try:
+            row = con.execute(
+                "SELECT cwd FROM terminal_panes WHERE uuid = ?",
+                (bytes.fromhex(uuid),)).fetchone()
+        finally:
+            con.close()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+def _wlog(msg):
+    """Append a one-line diagnostic to resume.log. Every no-resume path says WHY, so a
+    silent 'nothing happened' after a restart is diagnosable (esp. the first reboot, which
+    validates the uuid-stability assumption). Never raises."""
+    try:
+        with open(os.path.join(RECOV, "resume.log"), "a") as fh:
+            fh.write("%s warp: %s\n" % (time.strftime("%F %T"), msg))
+    except Exception:
+        pass
+
+
+def resolve_warp(uuid):
+    """Warp restore resolver (claude). Returns '<agent>\\t<sid>' (launcher chosen by the
+    hook) or '' for no-resume. '' on: no binding (fresh tab / cleanly-exited / uuid not
+    stable across restore), missing transcript, or a live cwd mismatch. Each case is
+    logged distinctly — 'no binding' after a restart means the uuid was NOT reused."""
+    if not WARP_UUID_RE.match(uuid or ""):
+        return ""
+    try:
+        with open(os.path.join(WARP_BINDINGS, uuid), "r") as fh:
+            parts = fh.read().strip().split("\t")
+    except OSError:
+        # no binding -> nothing was live in this pane -> no resume. (After a restart this
+        # also covers "Warp assigned a NEW pane uuid" — fail-closed, never a wrong resume.)
+        _wlog("no binding for pane %s — no resume (fresh pane, clean exit, or uuid not reused)" % uuid[:8])
+        return ""
+    if len(parts) < 2:
+        _wlog("malformed binding for pane %s — no resume" % uuid[:8])
+        return ""
+    cwd, sid = parts[0], parts[1]
+    if not sid or not UUID_RE.match(sid):
+        _wlog("bad session id in binding for pane %s — no resume" % uuid[:8])
+        return ""
+    # transcript must still exist, else `claude --resume` starts a FRESH session
+    if not _transcript_exists("claude", cwd, sid):
+        _wlog("transcript gone for %s (pane %s) — no resume" % (sid[:8], uuid[:8]))
+        return ""
+    # defense-in-depth (NON-blocking on absence): if Warp still lists this pane its cwd
+    # must match the binding's -> a genuine mismatch skips (fail-closed). Absent/unreadable
+    # (Warp may not have rewritten the row yet the instant the restored shell spawns) ->
+    # TRUST the self-recorded binding and proceed. realpath so a symlinked path
+    # (/tmp -> /private/tmp) isn't a false mismatch.
+    live_cwd = _warp_pane_cwd(uuid)
+    if live_cwd is None:
+        _wlog("pane %s not yet in warp.sqlite — trusting binding (proceed)" % uuid[:8])
+    elif os.path.realpath(live_cwd) != os.path.realpath(cwd):
+        _wlog("cwd mismatch pane %s (warp=%s binding=%s) — no resume" % (uuid[:8], live_cwd, cwd))
+        return ""
+    return "\t".join(["claude", sid])
+
+
+def gc_warp_bindings(max_age_days=14):
+    """Sweep orphan bindings (a pane crashed/was killed so SessionEnd never fired).
+    mtime-based + best-effort 'uuid no longer a Warp pane'. Cheap; SessionEnd handles
+    the clean-exit case, so this only mops up crashes."""
+    removed = 0
+    try:
+        names = os.listdir(WARP_BINDINGS)
+    except OSError:
+        return 0
+    now = time.time()
+    live = None
+    db = _warp_db()
+    if db:
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True, timeout=1.0)
+            try:
+                live = {r[0].hex() for r in con.execute("SELECT uuid FROM terminal_panes") if r[0]}
+            finally:
+                con.close()
+        except Exception:
+            live = None
+    for name in names:
+        p = os.path.join(WARP_BINDINGS, name)
+        try:
+            old = (now - os.path.getmtime(p)) > max_age_days * 86400
+            gone = (live is not None and WARP_UUID_RE.match(name) and name.lower() not in live)
+            if old or gone:
+                os.remove(p); removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def _proc_cwd(pid):
+    """Exact working directory of a live process (macOS lsof)."""
+    try:
+        out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                             capture_output=True, text=True).stdout
+        for l in out.splitlines():
+            if l.startswith("n"):
+                return l[1:]
+    except Exception:
+        pass
+    return None
+
+
+def bootstrap_warp():
+    """Seed bindings for claude sessions ALREADY running in Warp panes, so they resume on
+    the next restart even though their SessionStart fired before this hook was installed.
+    Reads each live claude process's OWN env (exact uuid + sid) + its lsof cwd. Skips
+    sub-agent/child sessions (not the pane's primary conversation). Returns count written."""
+    n = 0
+    try:
+        os.makedirs(WARP_BINDINGS, exist_ok=True)
+        ps = subprocess.run(["ps", "-Ao", "pid=,command="], capture_output=True, text=True).stdout
+    except Exception:
+        return 0
+    for line in ps.splitlines():
+        p = line.strip().split(None, 1)
+        if len(p) < 2 or "claude" not in p[1].lower():
+            continue
+        try:
+            env = subprocess.run(["ps", "eww", "-o", "command=", "-p", p[0]],
+                                 capture_output=True, text=True).stdout
+        except Exception:
+            continue
+        mu = re.search(r"WARP_TERMINAL_SESSION_UUID=([0-9a-fA-F]{32})", env)
+        ms = re.search(r"CLAUDE_CODE_SESSION_ID=([0-9a-fA-F-]{36})", env)
+        if not mu or not ms:
+            continue   # need both the pane id and the session id (a Warp claude pane)
+        # NOTE: no CLAUDE_CODE_CHILD_SESSION filter — `ps eww` truncates the long env before
+        # that var, so it's unreliable here. Per-uuid the sid is consistent (helper procs
+        # share it); the SessionStart hook corrects any binding going forward.
+        uuid, sid = mu.group(1), ms.group(1)
+        cwd = _proc_cwd(p[0]) or HOME
+        if not _transcript_exists("claude", cwd, sid):
+            continue
+        try:
+            with open(os.path.join(WARP_BINDINGS, uuid), "w") as fh:
+                fh.write("%s\t%s\n" % (cwd, sid))
+            n += 1
+        except OSError:
+            pass
+    return n
+
+
+def warp_plan():
+    """Dry-run: what WOULD resume in Warp right now (one line per live binding)."""
+    try:
+        names = sorted(os.listdir(WARP_BINDINGS))
+    except OSError:
+        names = []
+    live = [n for n in names if WARP_UUID_RE.match(n)]
+    print(f"# {len(live)} Warp pane(s) have a live-session binding "
+          f"[resume after next restart]\n")
+    for n in live:
+        r = resolve_warp(n)
+        if not r:
+            continue
+        _agent, sid = r.split("\t")[:2]
+        try:
+            cwd = open(os.path.join(WARP_BINDINGS, n)).read().split("\t")[0].replace(HOME, "~")
+        except OSError:
+            cwd = "?"
+        lbl = _label(sid)
+        print(f"{cwd}\n   claude {sid[:8]}…  {('- ' + lbl) if lbl else ''}")
 
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "plan"
     if cmd == "resolve" and len(sys.argv) >= 4:
         print(resolve(sys.argv[2], sys.argv[3]))
+    elif cmd == "resolve-warp" and len(sys.argv) >= 3:
+        print(resolve_warp(sys.argv[2]))
     elif cmd == "plan":
         plan()
+    elif cmd == "warp-plan":
+        warp_plan()
+    elif cmd == "gc-warp":
+        print(gc_warp_bindings())
+    elif cmd == "bootstrap-warp":
+        print(bootstrap_warp())
     elif cmd == "bootid":
         print(boot_id())
     elif cmd == "native":
