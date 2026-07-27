@@ -23,6 +23,9 @@ import os, sys, json, subprocess, time
 
 HOME = os.path.expanduser("~")
 RECOV = os.path.join(HOME, ".superset-recovery")
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import titlelib            # what to CALL a conversation — shared with every other surface
 LIB = os.path.join(RECOV, "resume-lib.py")
 SHELLDIR = os.path.join(RECOV, "warp-shell")
 PENDING = os.path.join(RECOV, "pending")
@@ -161,26 +164,16 @@ def records():
 
 
 def name_of(sid):
-    """The conversation's own title, so the report reads like your session list."""
+    """The conversation's own title, so this report reads like your session list.
+
+    Same rule as every other surface — a pane you are about to restore must be listed under
+    the name you will see on it afterwards, or you cannot tell which one you are choosing."""
     import glob
     for f in glob.glob(os.path.join(HOME, ".claude", "projects", "*", sid + ".jsonl")):
-        named = ""
-        try:
-            with open(f, errors="ignore") as fh:
-                for line in fh:
-                    if '"ai-title"' in line:
-                        try:
-                            o = json.loads(line)
-                            if o.get("type") == "ai-title":
-                                named = o.get("aiTitle") or named
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-        if named:
-            return " ".join(named.split())[:54]
-        return "(unnamed)"
-    return ""
+        return titlelib.name_of(f, 54, "(unnamed)")
+    # No transcript: this pane is bound to a conversation that is no longer on disk, so it
+    # can never be resumed. Say that, rather than printing eight characters of its id.
+    return "(conversation no longer on disk)"
 
 
 def wait_slot(label):
@@ -242,7 +235,7 @@ def main():
 
     plan, skip = [], []
     for _mt, pane, sid in records():
-        label = name_of(sid) or sid[:8]
+        label = name_of(sid)
         pid = shell_of(pane)
         if not pid:
             skip.append((pane, label, "no live shell registered for this pane"))
@@ -262,7 +255,7 @@ def main():
             skip.append((pane, label, f"unsupported agent {agent or '?'}")); continue
         if rsid in busy:
             skip.append((pane, label, "that conversation is already open elsewhere")); continue
-        plan.append((pane, pid, rsid, name_of(rsid) or rsid[:8]))
+        plan.append((pane, pid, rsid, name_of(rsid)))
 
     if not plan and not skip:
         print("\n  No pane records yet. Nothing to do.\n"); return 0

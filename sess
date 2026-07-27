@@ -22,55 +22,15 @@ HOME = os.path.expanduser("~")
 HOME_ENC = HOME.replace("/", "-")
 PROJ = os.path.join(HOME, ".claude", "projects")
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import titlelib            # what to CALL a conversation — shared with every other surface
+
 
 def label(path, limit=72):
-    """The conversation's real NAME — the same title Claude shows you (`ai-title` /
-    `aiTitle` in the transcript, kept current as the session evolves). Falls back to the
-    first user message only when a session has no name yet."""
-    named = ""
-    try:
-        with open(path, errors="ignore") as fh:
-            for line in fh:
-                if '"ai-title"' not in line:
-                    continue
-                try:
-                    o = json.loads(line)
-                except Exception:
-                    continue
-                if o.get("type") == "ai-title":
-                    named = o.get("aiTitle") or named   # last one wins = most current
-    except Exception:
-        pass
-    if named:
-        return " ".join(named.split())[:limit]
-    try:
-        with open(path, errors="ignore") as fh:
-            for i, line in enumerate(fh):
-                if i > 400:
-                    break
-                try:
-                    o = json.loads(line)
-                except Exception:
-                    continue
-                if o.get("type") != "user":
-                    continue
-                c = o.get("message", {}).get("content")
-                t = None
-                if isinstance(c, list):
-                    for p in c:
-                        if isinstance(p, dict) and p.get("type") == "text":
-                            t = p.get("text"); break
-                elif isinstance(c, str):
-                    t = c
-                if not t:
-                    continue
-                t = " ".join(t.split())
-                if not t or t[0] == "<" or t.startswith("Caveat") or t.startswith("[Request"):
-                    continue
-                return t[:limit]
-    except Exception:
-        pass
-    return "(no text yet)"
+    """The conversation's real NAME — the same title Claude shows you, and the same one the
+    pane header and a restored tab will show. Searching by a name only this tool knows is
+    how you end up reopening the wrong conversation."""
+    return titlelib.name_of(path, limit, "(no text yet)")
 
 
 def sessions(days=1.0, match=None, here=False):

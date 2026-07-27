@@ -14,9 +14,10 @@ echo "Installing pane-resume → $DEST"
 mkdir -p "$DEST"
 cp "$SRC/resume-lib.py" "$SRC/resume-hook.zsh" "$SRC/superset-resume" \
    "$SRC/warp-session-hook.py" "$SRC/pane-title.py" "$SRC/titlelib.py" \
-   "$SRC/restore-plan" "$SRC/restore-in-place" "$DEST/"
+   "$SRC/restore-plan" "$SRC/restore-in-place" "$SRC/sess" "$DEST/"
+# titlelib is imported by the others, not run, so it stays non-executable on purpose.
 chmod +x "$DEST/superset-resume" "$DEST/resume-lib.py" "$DEST/warp-session-hook.py" \
-         "$DEST/pane-title.py" "$DEST/restore-plan" "$DEST/restore-in-place"
+         "$DEST/pane-title.py" "$DEST/restore-plan" "$DEST/restore-in-place" "$DEST/sess"
 
 # Wire ~/.zshrc (idempotent: replace an existing managed block, else append).
 BLOCK="$BEGIN

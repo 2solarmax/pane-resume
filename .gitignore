@@ -1,0 +1,3 @@
+# titlelib is imported by the other tools, so Python caches it next to the source.
+__pycache__/
+*.pyc
