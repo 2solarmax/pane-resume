@@ -337,6 +337,29 @@ def agent_running(term_id):
 # in a shared dir onto one session). Pane identity = WARP_TERMINAL_SESSION_UUID, which Warp
 # persists in terminal_panes and reuses on restore.
 
+def warp_epoch():
+    """Identity of the CURRENT Warp run: its main process start time.
+
+    Resume must fire ONCE PER WARP LAUNCH per pane — not once per shell. Keying the
+    one-shot lock on the boot (the old behaviour) meant: quit a session -> the pane's
+    next shell resumed it again -> you could not quit (2026-07-27, live loop). Keying it
+    on the Warp run gives both halves: a crash/relaunch is a NEW epoch so every pane
+    restores, while inside one run a pane resumes at most once, so a quit stays quit.
+    Empty string if Warp isn't found (caller then falls back to the boot id)."""
+    try:
+        out = subprocess.run(["ps", "-Ao", "pid=,lstart=,command="],
+                             capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            if "Warp.app/Contents/MacOS/" in line and "--type=" not in line:
+                parts = line.split(None, 1)
+                pid = parts[0]
+                started = parts[1].split("/Applications")[0].strip()
+                return "warp-%s-%s" % (pid, re.sub(r"[^0-9A-Za-z]", "", started))
+    except Exception:
+        pass
+    return ""
+
+
 def _warp_db():
     """Path to Warp's session-restoration sqlite (Group Container). Glob the team-id
     prefix so a different Warp build/team-id still resolves. None if not found."""
@@ -554,6 +577,8 @@ if __name__ == "__main__":
         print(bootstrap_warp())
     elif cmd == "bootid":
         print(boot_id())
+    elif cmd == "warp-epoch":
+        print(warp_epoch())
     elif cmd == "native":
         print("1" if native_resume_present() else "0")
     elif cmd == "agent-running" and len(sys.argv) >= 3:

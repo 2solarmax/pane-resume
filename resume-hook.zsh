@@ -70,7 +70,17 @@ if [[ -o interactive ]] \
     fi
 
     # 2) Only now commit the one-shot guards (this pane WILL resume).
-    bootid="$(command python3 "$lib" bootid 2>/dev/null)"
+    #    SCOPE OF THE ONE-SHOT — this is the load-bearing bit:
+    #    Warp  -> the current WARP RUN (pid+start). A crash/relaunch is a new epoch, so every
+    #             pane restores once; inside one run a pane resumes at most once, so when you
+    #             quit a session it STAYS quit (the 2026-07-27 "can't Ctrl-C out" loop).
+    #    Superset -> the boot (unchanged).
+    if (( is_warp )); then
+      bootid="$(command python3 "$lib" warp-epoch 2>/dev/null)"
+      [[ -n "$bootid" ]] || bootid="$(command python3 "$lib" bootid 2>/dev/null)"
+    else
+      bootid="$(command python3 "$lib" bootid 2>/dev/null)"
+    fi
     [[ -n "$bootid" ]] || return 0
     # opportunistically reap other-boot lock dirs (bounded on-disk state); slots/ is
     # legacy stagger state (removed 2026-07-14) — clear it entirely if still present
@@ -139,13 +149,13 @@ if [[ -o interactive ]] \
     print -r -- "$(command date '+%F %T')   -> exec: $base[*]" >> "$log" 2>/dev/null
     "$base[@]"
     local rc=$?
-    # If the launcher never started the agent (e.g. a wrapper needs a backend/creds not ready
-    # this early after a restart), it exits non-zero and the pane is a bare shell. Release the
-    # whole one-shot lock so simply re-opening that pane retries the resume (env is up by then)
-    # instead of permanently burning it for this boot.
+    # DO NOT release the lock on failure. Releasing it created a tight relaunch loop
+    # (2026-07-27): launcher fails -> lock released -> the pane's next shell resumes ->
+    # fails -> ... and the same path re-launched a session the user had just quit. The
+    # one-shot now holds for the whole Warp run; a failed launch leaves a normal shell and
+    # is reported here. Re-run it yourself, or it resumes on the next Warp start.
     if (( rc != 0 )); then
-      command rm -rf "$lockdir" 2>/dev/null
-      print -r -- "$(command date '+%F %T')   -> launcher exit rc=$rc; released for retry" >> "$log" 2>/dev/null
+      print -r -- "$(command date '+%F %T')   -> launcher exit rc=$rc; left as shell (no auto-retry)" >> "$log" 2>/dev/null
     fi
     return 0
   }
