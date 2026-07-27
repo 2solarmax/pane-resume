@@ -11,6 +11,11 @@
 #   superset-resume plan      Dry-run: print the exact resume plan, changing nothing.
 #   superset-resume self-test Verify THIS pane maps to a real, on-disk conversation, WITHOUT
 #                             resuming (works in a Superset or a Warp pane).
+#   superset-resume wait-slot Block until it is this pane's turn to start an agent, so a
+#                             30-pane restore ramps up a few at a time instead of all at
+#                             once. Used as `superset-resume wait-slot && <launch cmd>`.
+#                             Fails OPEN: it always eventually returns 0.
+#   superset-resume slots     Show the start-throttle settings and what holds a slot now.
 #
 # Note: the auto-resume hook is zsh-only (macOS default). Bash panes won't auto-resume.
 # In Warp, only claude sessions are supported (codex/gemini: coming).
@@ -18,6 +23,47 @@ set -euo pipefail
 RECOV="$HOME/.superset-recovery"
 LIB="$RECOV/resume-lib.py"
 ARMED="$RECOV/armed"
+
+POOL="$RECOV/starting"
+
+# ── START THROTTLE ────────────────────────────────────────────────────────────────
+# Restoring 30 panes means 30 agents starting at once: each is ~10 CPU-seconds and spawns a
+# tree of MCP subprocesses, so the honest worry is a machine that thrashes for minutes with
+# every pane unusable. This bounds how many may be STARTING at the same time.
+#
+# The pool is a set of directories, `starting/0 … starting/N-1`. `mkdir` is atomic, so
+# creating one IS the lock — no lock file to corrupt, no pid to go stale.
+#
+# A slot is released by TIME, not by a process. Holding it for SETTLE seconds and letting it
+# expire from its own mtime means there is no releaser to spawn, nothing to signal, and no
+# way to deadlock: if a waiter is killed mid-wait, or the machine sleeps, or a launch dies,
+# the slot still frees itself. The cost is that SETTLE is a fixed estimate rather than the
+# real settle time; measured on this machine, claude → last MCP descendant took 7-14s over
+# 13 live session trees (median 9), so 12 is a deliberate slight over-estimate.
+#
+# NOT named `slots/` on purpose — that name belongs to the removed 2026-07-14 stagger and is
+# still deleted on sight by two other code paths.
+throttle_cap() {
+  local cap ncpu
+  cap="$(cat "$RECOV/starting-cap" 2>/dev/null || true)"
+  if [[ "$cap" =~ ^[0-9]+$ ]] && [[ "$cap" -ge 1 ]] && [[ "$cap" -le 64 ]]; then
+    echo "$cap"; return 0
+  fi
+  ncpu="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+  [[ "$ncpu" =~ ^[0-9]+$ ]] || ncpu=4
+  cap=$(( ncpu / 4 ))
+  if [[ "$cap" -lt 2 ]]; then cap=2; fi
+  if [[ "$cap" -gt 6 ]]; then cap=6; fi
+  echo "$cap"
+}
+throttle_settle() {
+  local s
+  s="$(cat "$RECOV/starting-settle" 2>/dev/null || true)"
+  if [[ "$s" =~ ^[0-9]+$ ]] && [[ "$s" -ge 1 ]] && [[ "$s" -le 300 ]]; then echo "$s"; else echo 12; fi
+}
+throttle_log() {
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$RECOV/resume.log" 2>/dev/null || true
+}
 
 in_warp() { [[ "${TERM_PROGRAM:-}" == "WarpTerminal" && -n "${WARP_TERMINAL_SESSION_UUID:-}" ]]; }
 has_superset() { [[ -n "${SUPERSET_TERMINAL_ID:-}" ]] || compgen -G "$HOME/.superset/host/*/host.db" >/dev/null 2>&1; }
@@ -44,6 +90,7 @@ case "${1:-status}" in
       find "$RECOV/locks" -mindepth 1 -maxdepth 1 -type d ! -name "$bid" -exec rm -rf {} + 2>/dev/null || true
     fi
     rm -rf "$RECOV/slots" 2>/dev/null || true
+    rm -rf "$POOL" 2>/dev/null || true      # no slot may survive into a new boot
     if [[ -f "$RECOV/resume.log" && "$(wc -c < "$RECOV/resume.log" 2>/dev/null || echo 0)" -gt 1000000 ]]; then
       : > "$RECOV/resume.log"
     fi
@@ -94,7 +141,80 @@ case "${1:-status}" in
       echo "   session, or its transcript is gone). Safe no-op."
     fi
     ;;
+  wait-slot)
+    shift || true
+    label="${*:-agent}"
+    cap="$(throttle_cap)"; settle="$(throttle_settle)"
+    # Never block a pane longer than this, no matter what. Jittered because every waiter in a
+    # restore starts at the same instant: with a fixed budget they would all give up at the
+    # same second too, turning the fail-open into exactly the herd this exists to prevent.
+    budget=$(( 300 + RANDOM % 120 ))
+    mkdir -p "$POOL" 2>/dev/null || true
+    trap 'echo; exit 130' INT TERM   # Ctrl-C aborts the wait; `&&` then skips the launch
+    deadline=$(( $(date +%s) + budget ))
+    got=""; announced=0
+    while : ; do
+      i=0
+      while [[ "$i" -lt "$cap" ]]; do
+        if mkdir "$POOL/$i" 2>/dev/null; then got="$i"; break; fi
+        i=$(( i + 1 ))
+      done
+      if [[ -n "$got" ]]; then break; fi
+
+      # Every slot is taken. Free any whose hold has expired. Age comes from the slot dir's
+      # own mtime, which mkdir set atomically at creation. A NEGATIVE age (the clock stepped
+      # back) counts as expired: erring toward a burst is recoverable, erring toward a
+      # permanent block is not.
+      now="$(date +%s)"; reclaimed=0; i=0
+      while [[ "$i" -lt "$cap" ]]; do
+        m="$(stat -f %m "$POOL/$i" 2>/dev/null || true)"
+        if [[ -n "$m" ]]; then
+          age=$(( now - m ))
+          if [[ "$age" -ge "$settle" ]] || [[ "$age" -lt 0 ]]; then
+            # Rename, don't delete: rename is atomic, so exactly one of several waiters
+            # racing on the same expired slot wins it. The losers get ENOENT and rescan.
+            if mv "$POOL/$i" "$POOL/.gone.$$.$i.$RANDOM" 2>/dev/null; then reclaimed=1; fi
+          fi
+        fi
+        i=$(( i + 1 ))
+      done
+      rm -rf "$POOL"/.gone.* 2>/dev/null || true
+      if [[ "$reclaimed" -eq 1 ]]; then continue; fi
+
+      if [[ "$(date +%s)" -ge "$deadline" ]]; then
+        # FAIL OPEN. A throttle that can withhold a launch forever is worse than the herd it
+        # prevents — the whole point is that the session comes back.
+        throttle_log "THROTTLE fail-open after ${budget}s -> starting $label anyway"
+        exit 0
+      fi
+      if [[ "$announced" -eq 0 ]]; then
+        printf '\033[36m⏳ waiting for a start slot (%s agents start at a time)…\033[0m\n' "$cap" >&2
+        announced=1
+      fi
+      sleep 0.4
+    done
+    printf '%s\n' "$$" > "$POOL/$got/owner" 2>/dev/null || true
+    throttle_log "SLOT $got -> $label"
+    exit 0
+    ;;
+  slots)
+    cap="$(throttle_cap)"; settle="$(throttle_settle)"
+    echo "start throttle: at most $cap agent(s) starting at a time, ${settle}s each"
+    echo "  cap:    $RECOV/starting-cap     (absent -> derived from $(sysctl -n hw.ncpu 2>/dev/null || echo '?') cores)"
+    echo "  settle: $RECOV/starting-settle  (absent -> 12)"
+    held=0
+    if [[ -d "$POOL" ]]; then
+      now="$(date +%s)"
+      for d in "$POOL"/[0-9]*; do
+        [[ -d "$d" ]] || continue
+        m="$(stat -f %m "$d" 2>/dev/null || echo "$now")"
+        echo "  slot $(basename "$d"): held $(( now - m ))s (pid $(cat "$d/owner" 2>/dev/null || echo '?'))"
+        held=$(( held + 1 ))
+      done
+    fi
+    if [[ "$held" -eq 0 ]]; then echo "  no slot held right now"; fi
+    ;;
   *)
-    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 esac

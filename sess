@@ -19,6 +19,7 @@ Reads ~/.claude/projects. Never deletes anything.
 import os, sys, json, glob, time, subprocess, shutil
 
 HOME = os.path.expanduser("~")
+HOME_ENC = HOME.replace("/", "-")
 PROJ = os.path.join(HOME, ".claude", "projects")
 
 
@@ -133,7 +134,9 @@ def show(rows):
         sid = os.path.basename(f)[:-6]
         mark = "●" if sid in claimed else "○"
         when = time.strftime("%a %H:%M", time.localtime(m))
-        folder = proj.replace("-Users-maxkrasnykh-", "~/").replace("-Users-maxkrasnykh", "~")
+        # Claude encodes a project directory by replacing every "/" with "-", so the
+        # encoded form of $HOME is just that same substitution — derived, never hardcoded.
+        folder = proj.replace(HOME_ENC + "-", "~/").replace(HOME_ENC, "~")
         room = max(20, width - 36 - len(folder))
         print(f"  {i:>3}. {mark} {when:>9}  {folder[:30]:30}  {lb[:room]}")
     print()

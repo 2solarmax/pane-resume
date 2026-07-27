@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""
+restore-plan — rebuild a whole workspace of conversations in ONE action, instead of
+opening panes one at a time.
+
+Writes a Warp Launch Configuration: a window of tabs, each split into panes, each pane
+opening one conversation. You then run it once from Warp's command palette and every
+session comes back, each in its own pane, grouped by project.
+
+  restore-plan                 plan the ORPHANED conversations from the last 24h
+  restore-plan -d 3            last 3 days
+  restore-plan --all-known     include ones that already have a pane (default: skip)
+  restore-plan --per-tab 3     group N sessions per tab as split panes
+                               (default 1 = one tab per session, tab named after it)
+  restore-plan --name X        launch-configuration name (default: restore-sessions)
+  restore-plan --dry-run       print the plan, write nothing
+
+Then in Warp:  ⌘P → "Launch Configuration" → pick the name it prints.
+"""
+import os, sys, json, glob, time, shlex
+
+HOME = os.path.expanduser("~")
+PROJ = os.path.join(HOME, ".claude", "projects")
+RECOV = os.path.join(HOME, ".superset-recovery")
+LAUNCH_DIR = os.path.join(HOME, ".warp", "launch_configurations")
+
+
+def scan(path, limit=60):
+    """Read a transcript once: its real NAME, its own recorded cwd (authoritative — no
+    guessing from Claude's lossy directory encoding, which broke on worktrees), and how
+    many user messages it has (so one-shot throwaways can be skipped)."""
+    named = first = cwd = ""
+    users = 0
+    try:
+        with open(path, errors="ignore") as fh:
+            for line in fh:
+                if not cwd and '"cwd"' in line:
+                    try: cwd = json.loads(line).get("cwd", "") or ""
+                    except Exception: pass
+                if '"ai-title"' in line:
+                    try:
+                        o = json.loads(line)
+                        if o.get("type") == "ai-title":
+                            named = o.get("aiTitle") or named
+                    except Exception: pass
+                    continue
+                if '"type":"user"' in line.replace(" ", ""):
+                    users += 1
+                    if not first:
+                        try:
+                            o = json.loads(line)
+                            c = o.get("message", {}).get("content")
+                            t = c if isinstance(c, str) else (next(
+                                (p.get("text") for p in c if isinstance(p, dict)
+                                 and p.get("type") == "text"), None) if isinstance(c, list) else None)
+                            if t:
+                                t = " ".join(t.split())
+                                if t and t[0] != "<" and not t.startswith("Caveat"):
+                                    first = t
+                        except Exception: pass
+    except Exception:
+        pass
+    label = (" ".join((named or first).split()))[:limit] or "(unnamed)"
+    return label, cwd, users
+
+
+def real_name(path, limit=60):
+    """The conversation's own name (what Claude shows you), else its first message."""
+    named = ""
+    first = ""
+    try:
+        with open(path, errors="ignore") as fh:
+            for line in fh:
+                if '"ai-title"' in line:
+                    try:
+                        o = json.loads(line)
+                        if o.get("type") == "ai-title":
+                            named = o.get("aiTitle") or named
+                    except Exception:
+                        pass
+                elif not first and '"type":"user"' in line.replace(" ", ""):
+                    try:
+                        o = json.loads(line)
+                        c = o.get("message", {}).get("content")
+                        t = c if isinstance(c, str) else next(
+                            (p.get("text") for p in c if isinstance(p, dict)
+                             and p.get("type") == "text"), None) if isinstance(c, list) else None
+                        if t:
+                            t = " ".join(t.split())
+                            if t and t[0] != "<" and not t.startswith("Caveat"):
+                                first = t
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return (" ".join((named or first).split()))[:limit] or "(unnamed)"
+
+
+def decoded_cwd(projdir):
+    """Claude encodes the cwd by replacing every non-alphanumeric with '-', which is
+    lossy. Recover the real path by matching against directories that exist."""
+    cand = projdir.replace("-Users-", "/Users/", 1)
+    if os.path.isdir(cand):
+        return cand
+    parts = projdir.strip("-").split("-")
+    path = "/"
+    i = 0
+    while i < len(parts):
+        for j in range(len(parts), i, -1):
+            trial = os.path.join(path, " ".join(parts[i:j])) if False else os.path.join(path, "-".join(parts[i:j]))
+            alt = os.path.join(path, " ".join(parts[i:j]))
+            if os.path.isdir(trial):
+                path, i = trial, j; break
+            if os.path.isdir(alt):
+                path, i = alt, j; break
+        else:
+            return path if os.path.isdir(path) else HOME
+    return path
+
+
+def claimed():
+    out = set()
+    for sub in ("warp-bindings", "warp-last"):
+        d = os.path.join(RECOV, sub)
+        try:
+            for pane in os.listdir(d):
+                parts = open(os.path.join(d, pane)).read().strip().split("\t")
+                if len(parts) > 1:
+                    out.add(parts[1])
+        except OSError:
+            continue
+    return out
+
+
+def live_now():
+    """Which conversations are OPEN right now, and how many open ones we cannot name.
+
+    This is the one check that protects your data. Two copies of the same conversation
+    running at once both append to the same transcript file and interleave into nonsense —
+    so anything currently open must never be offered for reopening.
+
+    Two kinds of open conversation, and they need different handling:
+      - resumed  — the id is right there in how the process was started, so we know it
+      - freshly started — the id was assigned after launch, so nothing outside can name it.
+        For those we only learn HOW MANY there are, and treat the same number of
+        most-recently-written transcripts as off limits. Conservative on purpose: the cost
+        of holding one back is that you reopen it yourself; the cost of getting it wrong is
+        a damaged transcript.
+
+    Reads only how each process was started, and extracts only the conversation id — never
+    anything else from the process table, which on this machine can carry secrets.
+    """
+    import re, subprocess
+    agent_bin, resumed, running = "/.local/bin/claude", set(), 0
+    try:
+        out = subprocess.run(["ps", "-Ao", "pid=,command="],
+                             capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return set(), 0          # cannot tell -> caller must not act
+    for line in out.splitlines():
+        head = line.strip().split(" ", 1)
+        if len(head) < 2 or not head[1].startswith(("/Users", "/usr", "/opt", "/bin")):
+            continue
+        cmd = head[1]
+        if agent_bin not in cmd.split(" ", 1)[0]:
+            continue             # not an agent process — ignore it entirely
+        running += 1
+        m = re.search(r"--resume\s+([0-9a-fA-F-]{36})", cmd)
+        if m:
+            resumed.add(m.group(1).lower())
+    return resumed, max(0, running - len(resumed))
+
+
+FRESHLY_WRITTEN = 900          # 15 minutes
+
+
+def busy_sids():
+    """Every conversation that must be left alone because it may be open right now.
+
+    Resumed ones are known by name. For the freshly-started ones — whose id exists only
+    inside the process — we fall back to the one thing visible from outside: an open
+    conversation is being written to. So while ANY agent is running, a transcript touched in
+    the last few minutes is treated as possibly-open.
+
+    This deliberately does nothing in the case that matters most. After a crash or restart
+    no agent is running, so nothing is held back and the whole workspace is offered — while
+    during normal use, when reopening something would do damage, it stays cautious."""
+    resumed, unnamed = live_now()
+    out = set(resumed)
+    if unnamed <= 0:
+        return out
+    now = time.time()
+    for f in glob.glob(os.path.join(PROJ, "*", "*.jsonl")):
+        try:
+            if now - os.path.getmtime(f) < FRESHLY_WRITTEN:
+                out.add(os.path.basename(f)[:-6])
+        except OSError:
+            continue
+    return out
+
+
+def collect(days, include_known):
+    known = set() if include_known else claimed()
+    # --all-known widens what you SEE; it never lets an open conversation through.
+    known |= busy_sids()
+    cutoff = time.time() - days * 86400
+    rows = []
+    for f in glob.glob(os.path.join(PROJ, "*", "*.jsonl")):
+        try:
+            m = os.path.getmtime(f)
+        except OSError:
+            continue
+        if m < cutoff:
+            continue
+        sid = os.path.basename(f)[:-6]
+        if sid in known:
+            continue
+        label, cwd, users = scan(f)
+        if users < 2:
+            continue          # one-shot / throwaway session — nothing worth reopening
+        if not cwd or not os.path.isdir(cwd):
+            continue          # its folder is gone (deleted worktree) — can't reopen it there
+        rows.append((m, sid, cwd, label))
+    rows.sort(reverse=True)
+    return rows
+
+
+def build(rows, per_tab, name, launcher):
+    by_proj = {}
+    for m, sid, cwd, label in rows:
+        by_proj.setdefault(cwd, []).append((sid, label))
+    lines = ["---", f"name: {name}", "windows:", "  - tabs:"]
+    n_panes = 0
+    for cwd, items in by_proj.items():
+        short = os.path.basename(cwd) or cwd
+        for chunk_i in range(0, len(items), per_tab):
+            chunk = items[chunk_i:chunk_i + per_tab]
+            # One session in the tab -> name the TAB after the conversation (this is how
+            # you recognise it at a glance). Several -> name it after the project, and each
+            # PANE titles itself with its own conversation via the pane-label hook.
+            if len(chunk) == 1:
+                title = chunk[0][1]
+            else:
+                title = short if len(items) <= per_tab else f"{short} {chunk_i//per_tab + 1}"
+            lines.append(f"      - title: {json.dumps(title)}")
+            lines.append("        layout:")
+            if len(chunk) == 1:
+                sid, label = chunk[0]
+                lines.append(f"          cwd: {json.dumps(cwd)}")
+                lines.append("          commands:")
+                lines.append(f"            - exec: {json.dumps(launcher % sid)}")
+                n_panes += 1
+            else:
+                lines.append("          split_direction: horizontal")
+                lines.append("          panes:")
+                for sid, label in chunk:
+                    lines.append(f"            - cwd: {json.dumps(cwd)}")
+                    lines.append("              commands:")
+                    lines.append(f"                - exec: {json.dumps(launcher % sid)}")
+                    n_panes += 1
+    return "\n".join(lines) + "\n", n_panes
+
+
+def main():
+    a = sys.argv[1:]
+    days, per_tab, name, dry, include_known = 1.0, 1, "restore-sessions", False, False
+    i = 0
+    while i < len(a):
+        if a[i] == "-d" and i + 1 < len(a):
+            i += 1; days = float(a[i])
+        elif a[i] == "--per-tab" and i + 1 < len(a):
+            i += 1; per_tab = max(1, int(a[i]))
+        elif a[i] == "--name" and i + 1 < len(a):
+            i += 1; name = a[i]
+        elif a[i] == "--dry-run":
+            dry = True
+        elif a[i] == "--all-known":
+            include_known = True
+        elif a[i] in ("-h", "--help"):
+            print(__doc__); return 0
+        i += 1
+
+    rows = collect(days, include_known)
+    if not rows:
+        print("Nothing to restore — every conversation in that window already has a pane.")
+        print("Widen it:  restore-plan -d 7")
+        return 0
+
+    # Use the user's own wrapper when they have one, so env/routing matches their normal launch.
+    import subprocess
+    has_cc = subprocess.run(
+        ["zsh", "-ic", "w=$(whence -w cc 2>/dev/null); "
+                       "[[ \"$w\" == *': function' || \"$w\" == *': alias' ]]"],
+        capture_output=True,
+        env={**os.environ, "_SUPERSET_RESUME_DONE": "1"}).returncode == 0
+    launcher = "cc all --resume %s" if has_cc else "claude --resume %s"
+
+    # Every pane in this config launches the moment the window opens, so without a throttle a
+    # 69-pane restore starts 69 agents in the same second. Wait for a start slot first; the
+    # wait is a normal foreground command, so Ctrl-C in a pane just leaves it a plain shell.
+    # Guarded on the file existing: if it is missing, launch unthrottled rather than let `&&`
+    # swallow the launch and resume nothing.
+    throttle = os.path.join(RECOV, "superset-resume")
+    if os.access(throttle, os.X_OK):
+        launcher = f"{shlex.quote(throttle)} wait-slot && " + launcher
+
+    yaml, n_panes = build(rows, per_tab, name, launcher)
+    print(f"\n  {len(rows)} conversation(s) → {n_panes} pane(s)\n")
+    for _m, sid, cwd, label in rows:
+        print(f"    {os.path.basename(cwd)[:24]:24}  {label}")
+    if dry:
+        print("\n--- config (not written) ---\n"); print(yaml); return 0
+
+    # Last look before writing something you can run with one keystroke. Checked again here,
+    # not just during collection, because a conversation can be opened while you read the list.
+    busy = busy_sids()
+    clash = [sid for _m, sid, _c, _l in rows if sid in busy]
+    if clash:
+        print(f"\n  Not writing it: {len(clash)} of these are open right now.")
+        print("  Reopening an open conversation makes both copies write to the same")
+        print("  transcript at once, which corrupts it. Close them, or re-run to skip them.")
+        for sid in clash:
+            print(f"     {sid}")
+        print()
+        return 1
+
+    os.makedirs(LAUNCH_DIR, exist_ok=True)
+    path = os.path.join(LAUNCH_DIR, f"{name}.yaml")
+    with open(path, "w") as fh:
+        fh.write(yaml)
+    print(f"\n  Wrote {path}")
+    print(f"\n  Open it:  Warp ⌘P → \"Launch Configuration\" → {name}")
+    print("  Every pane comes back with its conversation. Nothing is opened until you run it.\n")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

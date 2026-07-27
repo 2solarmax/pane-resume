@@ -70,6 +70,48 @@ superset-resume bootstrap   # (Warp) seed bindings for sessions already running
 
 Arm it and leave it armed, so it's already on **before** your next restart. Panes resume as the terminal loads them.
 
+### Recovering after a restart you weren't armed for
+
+Arming only helps the *next* restart. If the terminal has already come back with a screen full
+of plain shells, two commands bring the conversations back to where they belong:
+
+```bash
+restore-in-place            # dry-run: which live panes map to which conversation
+restore-in-place --only 1 --go   # do just the first one, to see it work
+restore-in-place --go            # do the rest
+```
+
+`restore-in-place` types the resume command into panes that are still open, so each
+conversation lands back in the pane it came from. Panes whose conversation is already running
+are skipped, so it's safe to re-run.
+
+For conversations whose pane no longer exists — a window you closed, or a full quit —
+`restore-plan` writes a launch configuration that recreates them:
+
+```bash
+restore-plan                # writes a Warp launch configuration
+```
+
+Then open it from Warp's command palette (⌘P → "Launch Configuration"). Each pane comes back
+with its own title and resumes its own conversation.
+
+### Not all at once
+
+Thirty panes each starting an agent in the same second will bring a laptop to its knees, so
+launches are throttled: at most a few agents start at a time, each getting a few seconds to
+settle before the next batch. Every path — armed auto-resume, `restore-in-place`, and the
+generated launch configuration — goes through the same gate.
+
+It is deliberately impossible for the throttle to strand a pane. Slots expire on their own
+rather than being handed back by a releaser (nothing to crash, nothing to deadlock), and every
+wait has a hard budget of a few minutes after which the pane launches anyway. The budget is
+jittered per pane, because a fixed one would have every waiter give up in the same second —
+which is the stampede this exists to prevent. Ctrl-C during the wait leaves you in a plain
+shell rather than launching late.
+
+Tune with `superset-resume slots` (shows the current setting), or by writing to
+`~/.superset-recovery/starting-cap` and `starting-settle`.
+
 ## Safety
 
 Designed to be a no-op in every normal case and to never break your shell or fork-bomb:

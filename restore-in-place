@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""
+restore-in-place — bring conversations back into the panes you are ALREADY looking at.
+
+After Warp restarts it rebuilds your windows, tabs and panes, but every pane comes back as
+a bare shell. This walks those live panes and restores each one's own conversation INTO IT
+— no new tabs, no reopening, the layout you had is the layout you keep.
+
+  restore-in-place              show what it would do, change nothing (default)
+  restore-in-place --go         actually do it
+  restore-in-place --only <n>   only pane #n from the list (start with one)
+  restore-in-place --quiet      no per-pane detail
+
+A pane is only touched when ALL of these hold, so it can never interrupt you:
+  - the pane is live and its shell is idle at a prompt (nothing running in it)
+  - that shell registered itself, so we know it can accept the request
+  - we have a verified conversation for that exact pane, whose transcript still exists
+  - no agent is already running there
+
+Panes that fail any check are listed with the reason and left completely alone.
+"""
+import os, sys, json, subprocess, time
+
+HOME = os.path.expanduser("~")
+RECOV = os.path.join(HOME, ".superset-recovery")
+LIB = os.path.join(RECOV, "resume-lib.py")
+SHELLDIR = os.path.join(RECOV, "warp-shell")
+PENDING = os.path.join(RECOV, "pending")
+
+# Requests written this run. Ctrl-C now lands mid-queue rather than in a millisecond-long
+# loop, so an interrupted run can leave a request on disk for a pane that never read it.
+WROTE = []
+
+
+def lib(*args):
+    try:
+        r = subprocess.run([sys.executable, LIB, *args],
+                           capture_output=True, text=True, timeout=20)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+# Liveness deliberately comes from the shell's own registration record, NOT from scanning
+# process environments. macOS does not expose an idle shell's environment to `ps` at all, so
+# a process scan finds nothing for exactly the panes that matter here — ones sitting at a
+# bare prompt right after a restart. A live registration (its pid is alive, is a shell, and
+# its age matches the record) is both stronger and cheaper.
+
+
+def busy_sids():
+    """Conversations that are open right now — reused from restore-plan so there is exactly
+    one definition of 'open' in this toolkit.
+
+    Needed here too: a pane's record can point at a conversation you have since opened
+    somewhere else, and reopening it a second time makes both copies write to the same
+    transcript at once."""
+    try:
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        path = os.path.join(RECOV, "restore-plan")
+        spec = importlib.util.spec_from_file_location(
+            "restore_plan", path, loader=SourceFileLoader("restore_plan", path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.busy_sids()
+    except Exception:
+        return None          # unknown -> caller treats every pane as unsafe
+
+
+def shell_of(pane):
+    """The pid of the shell in this pane, as recorded by that shell itself — but ONLY if it
+    also carries the marker proving it installed the signal handler.
+
+    This matters more than it looks: the default action for the signal we send is to KILL
+    the process. Signalling a shell that never installed the handler would close the user's
+    pane. So an unmarked (older) shell reads as 'not registered' and is left alone.
+
+    It also guards against a recycled pid: the record is written when the shell starts, so
+    the shell's own age must match the record's. A different process that inherited the
+    number will not line up, and is refused."""
+    path = os.path.join(SHELLDIR, pane)
+    try:
+        with open(path) as fh:
+            parts = fh.read().strip().split("\t")
+        pid = int(parts[0])
+        if len(parts) < 2 or parts[1] != "trap1":
+            return 0                      # no handler contract -> must not be signalled
+        reg_mtime = os.path.getmtime(path)
+    except Exception:
+        return 0
+    started = start_epoch(pid)
+    if started is None or abs(started - reg_mtime) > 90:
+        return 0                          # not the process that wrote this record
+    return pid
+
+
+def start_epoch(pid):
+    """When this pid actually started, from its elapsed time — used to tell the shell that
+    registered apart from any later process that happens to hold the same number."""
+    try:
+        r = subprocess.run(["ps", "-o", "etime=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=10)
+        t = r.stdout.strip()
+        if not t:
+            return None
+        days, _, rest = t.partition("-")
+        if not rest:
+            days, rest = "0", days
+        bits = [int(x) for x in rest.split(":")]
+        while len(bits) < 3:
+            bits.insert(0, 0)
+        secs = int(days) * 86400 + bits[0] * 3600 + bits[1] * 60 + bits[2]
+        return time.time() - secs
+    except Exception:
+        return None
+
+
+def proc_name(pid):
+    try:
+        r = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=10)
+        return os.path.basename(r.stdout.strip())
+    except Exception:
+        return ""
+
+
+def has_child(pid):
+    """Something is running in the pane (an agent, an editor, a build) -> hands off."""
+    try:
+        r = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True, timeout=10)
+        return bool(r.stdout.strip())
+    except Exception:
+        return True          # cannot tell -> assume busy, never interrupt
+
+
+def records():
+    """Every pane we hold a conversation for, newest record first."""
+    seen, rows = {}, []
+    for sub in ("warp-bindings", "warp-last"):
+        d = os.path.join(RECOV, sub)
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for pane in names:
+            p = os.path.join(d, pane)
+            try:
+                mt = os.path.getmtime(p)
+                parts = open(p).read().strip().split("\t")
+            except OSError:
+                continue
+            if len(parts) < 2:
+                continue
+            if pane not in seen or mt > seen[pane][0]:
+                seen[pane] = (mt, parts[1])
+    for pane, (mt, sid) in seen.items():
+        rows.append((mt, pane.lower(), sid))
+    rows.sort(reverse=True)
+    return rows
+
+
+def name_of(sid):
+    """The conversation's own title, so the report reads like your session list."""
+    import glob
+    for f in glob.glob(os.path.join(HOME, ".claude", "projects", "*", sid + ".jsonl")):
+        named = ""
+        try:
+            with open(f, errors="ignore") as fh:
+                for line in fh:
+                    if '"ai-title"' in line:
+                        try:
+                            o = json.loads(line)
+                            if o.get("type") == "ai-title":
+                                named = o.get("aiTitle") or named
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        if named:
+            return " ".join(named.split())[:54]
+        return "(unnamed)"
+    return ""
+
+
+def wait_slot(label):
+    """Block until it is this pane's turn to start an agent.
+
+    Fails OPEN in every direction: if the throttle is missing, unreadable or errors, we start
+    the agent anyway. A restore that refuses to restore is worse than a busy machine."""
+    tool = os.path.join(RECOV, "superset-resume")
+    if not os.access(tool, os.X_OK):
+        return
+    try:
+        subprocess.run([tool, "wait-slot", label], timeout=600)
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        pass
+
+
+def still_safe(pane, pid, sid, busy_now):
+    """Re-run the safety checks at the moment of acting. Returns a reason to skip, or ''.
+
+    Same checks as the planning pass; see the header. They are re-run rather than trusted
+    because the throttle can put minutes between planning and acting."""
+    if busy_now is None:
+        return "cannot tell what is open right now"
+    if not isinstance(pid, int) or pid <= 1:
+        return "implausible shell pid"          # pid 0/1 would signal the whole process group
+    if shell_of(pane) != pid:
+        return "its shell changed since the plan was made"
+    if "zsh" not in proc_name(pid):
+        return "its shell is gone (replaced)"
+    if has_child(pid):
+        return "you started using it while it waited"
+    if lib("agent-running", pane) == "1":
+        return "an agent started there while it waited"
+    if sid in busy_now:
+        return "that conversation was opened elsewhere while it waited"
+    return ""
+
+
+def main():
+    a = sys.argv[1:]
+    go = "--go" in a
+    quiet = "--quiet" in a
+    only = 0
+    if "--only" in a:
+        i = a.index("--only")
+        if i + 1 < len(a):
+            try: only = int(a[i + 1])
+            except ValueError: pass
+    if "-h" in a or "--help" in a:
+        print(__doc__); return 0
+
+    busy = busy_sids()
+    if busy is None:
+        print("\n  Cannot tell which conversations are open right now, so nothing is touched.")
+        print("  (Reopening one that is already open would damage its transcript.)\n")
+        return 1
+
+    plan, skip = [], []
+    for _mt, pane, sid in records():
+        label = name_of(sid) or sid[:8]
+        pid = shell_of(pane)
+        if not pid:
+            skip.append((pane, label, "no live shell registered for this pane"))
+            continue
+        if "zsh" not in proc_name(pid):
+            skip.append((pane, label, "its shell is gone (replaced)")); continue
+        if has_child(pid):
+            skip.append((pane, label, "busy — something is running in it")); continue
+        if lib("agent-running", pane) == "1":
+            skip.append((pane, label, "already has an agent")); continue
+        resolved = lib("resolve-warp", pane)
+        if not resolved:
+            skip.append((pane, label, "no verified conversation for this pane")); continue
+        parts = resolved.split("\t")
+        agent, rsid = (parts + ["", ""])[:2]
+        if agent != "claude" or not rsid:
+            skip.append((pane, label, f"unsupported agent {agent or '?'}")); continue
+        if rsid in busy:
+            skip.append((pane, label, "that conversation is already open elsewhere")); continue
+        plan.append((pane, pid, rsid, name_of(rsid) or rsid[:8]))
+
+    if not plan and not skip:
+        print("\n  No pane records yet. Nothing to do.\n"); return 0
+
+    print()
+    if plan:
+        print(f"  {len(plan)} pane(s) can be restored in place:\n")
+        for i, (pane, pid, sid, label) in enumerate(plan, 1):
+            print(f"   {i:>2}. pane {pane[:8]}  shell {pid:<7} {label}")
+    if skip and not quiet:
+        print(f"\n  {len(skip)} left alone:\n")
+        for pane, label, why in skip:
+            print(f"       pane {pane[:8]}  {label[:40]:40} — {why}")
+
+    if not go:
+        print("\n  Nothing has been touched. To do it:  restore-in-place --go")
+        print("  Try one pane first:                  restore-in-place --only 1 --go\n")
+        return 0
+
+    if only:
+        if not (1 <= only <= len(plan)):
+            print(f"\n  No pane #{only} in that list.\n"); return 1
+        plan = [plan[only - 1]]
+
+    os.makedirs(PENDING, exist_ok=True)
+    # Match the launcher the pane would use itself, so env and routing are unchanged.
+    has_cc = subprocess.run(
+        ["zsh", "-ic", "w=$(whence -w cc 2>/dev/null); "
+                       "[[ \"$w\" == *': function' || \"$w\" == *': alias' ]]"],
+        capture_output=True,
+        env={**os.environ, "_SUPERSET_RESUME_DONE": "1"}).returncode == 0
+    print()
+    done = 0
+    sent = []
+    for pane, pid, sid, label in plan:
+        # Take a start slot BEFORE waking this pane, so restoring 30 panes brings a few agents
+        # up at a time instead of all at once. The wait happens here, in the one process you
+        # are watching, rather than in each pane: 30 panes each running their own wait would
+        # just move the pile-up, and this way Ctrl-C here stops the whole run.
+        wait_slot(label)
+
+        # Re-check, because the throttle changed the physics of this loop. Without it, the
+        # checks above and this signal were milliseconds apart; with it, a pane late in the
+        # queue is signalled minutes later — long enough for you to have started working in
+        # that pane, or opened this very conversation somewhere else. Re-opening it then would
+        # put two agents on one transcript, which is exactly what the checks at the top exist
+        # to prevent. So they are worth nothing unless they hold at the moment we act.
+        why = still_safe(pane, pid, sid, busy_now=busy_sids())
+        if why:
+            print(f"   pane {pane[:8]}  skipped — {why}")
+            continue
+
+        cmd = (f"cc all --resume {sid}" if has_cc else f"claude --resume {sid}")
+        req = os.path.join(PENDING, pane)
+        try:
+            with open(req, "w") as fh:
+                fh.write(cmd + "\n")
+            WROTE.append(req)
+            os.kill(pid, __import__("signal").SIGUSR1)
+        except Exception as e:
+            print(f"   pane {pane[:8]}  could not be reached: {e}")
+            try: os.unlink(req)
+            except OSError: pass
+            continue
+        done += 1
+        sent.append((pane, pid, sid, label))
+        print(f"   pane {pane[:8]}  → {label}")
+    skipped = len(plan) - len(sent)
+    plan = sent
+    time.sleep(1.2)
+    # A request left on disk means that pane never picked it up; say so rather than
+    # claiming success, and clean it up so it can't fire later by surprise.
+    stuck = [p for p, _pid, _s, _l in plan if os.path.exists(os.path.join(PENDING, p))]
+    for p in stuck:
+        try: os.unlink(os.path.join(PENDING, p))
+        except OSError: pass
+    print(f"\n  Restored {done - len(stuck)} of {len(plan) + skipped} pane(s) in place.")
+    if skipped:
+        print(f"  {skipped} became unsafe to touch while waiting and were left alone.")
+    if stuck:
+        print(f"  {len(stuck)} did not respond (left untouched): "
+              + ", ".join(s[:8] for s in stuck))
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # Leave nothing armed behind: an unread request would otherwise sit there and fire the
+        # next time anything signals that pane.
+        left = 0
+        for req in WROTE:
+            try:
+                os.unlink(req); left += 1
+            except OSError:
+                pass
+        print(f"\n  Stopped. {left} unread request(s) cleared; panes already restored stay.\n")
+        sys.exit(130)

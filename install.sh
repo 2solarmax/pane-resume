@@ -13,8 +13,10 @@ END="# <<< superset-recovery <<<"
 echo "Installing pane-resume → $DEST"
 mkdir -p "$DEST"
 cp "$SRC/resume-lib.py" "$SRC/resume-hook.zsh" "$SRC/superset-resume" \
-   "$SRC/warp-session-hook.py" "$DEST/"
-chmod +x "$DEST/superset-resume" "$DEST/resume-lib.py" "$DEST/warp-session-hook.py"
+   "$SRC/warp-session-hook.py" "$SRC/pane-title.py" \
+   "$SRC/restore-plan" "$SRC/restore-in-place" "$DEST/"
+chmod +x "$DEST/superset-resume" "$DEST/resume-lib.py" "$DEST/warp-session-hook.py" \
+         "$DEST/pane-title.py" "$DEST/restore-plan" "$DEST/restore-in-place"
 
 # Wire ~/.zshrc (idempotent: replace an existing managed block, else append).
 BLOCK="$BEGIN
@@ -46,4 +48,7 @@ echo
 echo "Done. It's installed but DISARMED (opt-in)."
 echo "  superset-resume plan     # see what would resume"
 echo "  superset-resume on       # arm it, so your NEXT restart auto-resumes panes"
+echo
+echo "Already restarted without it armed? Recover the panes you have open now:"
+echo "  restore-in-place         # dry-run, then add --go"
 echo "Open a new shell (or: source ~/.zshrc) to load the hook."

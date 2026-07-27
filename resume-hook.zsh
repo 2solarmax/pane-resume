@@ -28,7 +28,10 @@
 # what each one held. So each pane re-labels itself from its own saved record: the topic
 # of the conversation it was running. This is the half that must work even when the
 # session is NOT auto-restored — you can then reopen it deliberately (`sess`).
+# (_SUPERSET_RESUME_DONE excludes the senders' `zsh -ic` probes: they are not a pane and
+# would emit a title escape into the probe's captured stdout.)
 if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \
+   && [[ -z "$_SUPERSET_RESUME_DONE" ]] \
    && [[ "$TERM_PROGRAM" == "WarpTerminal" ]] \
    && [[ "$WARP_TERMINAL_SESSION_UUID" =~ '^[0-9a-fA-F]{32}$' ]]; then
   () {
@@ -36,6 +39,65 @@ if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \
     local lbl
     lbl="$(command python3 "$HOME/.superset-recovery/resume-lib.py" pane-label "$WARP_TERMINAL_SESSION_UUID" 2>/dev/null)"
     [[ -n "$lbl" ]] && print -n -- $'\033]0;'"${lbl[1,60]}"$'\007'
+  }
+fi
+
+# ── RESTORE INTO THE PANE YOU ARE ALREADY LOOKING AT ─────────────────────────────
+# The other half of this file restores a conversation when a pane is FRESHLY OPENED. This
+# half restores one into a pane that is ALREADY OPEN and sitting at a prompt — no reopening,
+# no new tab, the conversation comes back exactly where it was.
+#
+# It works because an idle interactive zsh runs a signal trap the moment it is signalled
+# from outside. Two facts only the shell itself knows are needed, and macOS will not reveal
+# a shell's environment to `ps`, so the shell records them here:
+#   which pane it is in ($WARP_TERMINAL_SESSION_UUID) and which process it is ($$).
+#
+# Safety, in order of how badly each one bites:
+#   * the command is a CHILD, never `exec` — quit the agent and you are back at a normal
+#     prompt in the same pane (an `exec` would close the pane on quit).
+#   * the request is CONSUMED (deleted) before it runs, so it can fire at most once. This is
+#     what stops the 2026-07-27 "cannot Ctrl-C out of it" loop from ever coming back.
+#   * a request older than 2 minutes is ignored — a signal that arrived while the pane was
+#     busy must not resurrect a conversation you quit ten minutes ago.
+#   * the sender only ever signals a pane whose shell has NO child running, so a pane that
+#     is mid-conversation is never disturbed.
+#
+# The _SUPERSET_RESUME_DONE guard is load-bearing, not defensive tidiness. This record must
+# only ever be written by the pane's OWN long-lived shell. The senders (restore-in-place,
+# restore-plan) probe a pane by running `zsh -ic` inside it, which sources this file; without
+# the guard that transient subshell overwrote the record with its own pid and then exited,
+# leaving the pane registered to a DEAD process — so running restore-in-place silently
+# destroyed the restorability of the very pane you ran it from, and every later run skipped
+# that pane as "no live shell registered". Reproduced 2026-07-27; both senders already
+# set this variable in the probe's environment.
+if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \
+   && [[ -z "$_SUPERSET_RESUME_DONE" ]] \
+   && [[ "$TERM_PROGRAM" == "WarpTerminal" ]] \
+   && [[ "$WARP_TERMINAL_SESSION_UUID" =~ '^[0-9a-fA-F]{32}$' ]]; then
+  # The registration file is also the PROOF that the trap below exists in this shell.
+  # Without the trap, SIGUSR1 would KILL the shell (that is the default action), so the
+  # sender must never signal a shell that has not written this. The marker is written in
+  # the same block as the trap and names the trap's contract, so an older shell from
+  # before this feature (no marker) or a future incompatible one is never signalled.
+  command mkdir -p "$HOME/.superset-recovery/warp-shell" 2>/dev/null
+  print -r -- "$$	trap1" > "$HOME/.superset-recovery/warp-shell/$WARP_TERMINAL_SESSION_UUID" 2>/dev/null
+  TRAPUSR1() {
+    emulate -L zsh
+    local recov="$HOME/.superset-recovery" req cmd mtime now
+    req="$recov/pending/$WARP_TERMINAL_SESSION_UUID"
+    [[ -f "$req" ]] || return 0
+    mtime="$(command stat -f %m "$req" 2>/dev/null)"   # read the age BEFORE consuming it
+    cmd="$(command cat "$req" 2>/dev/null)"
+    command rm -f "$req" 2>/dev/null            # consume first: can never fire twice
+    [[ -n "$cmd" ]] || return 0
+    now="$(command date +%s 2>/dev/null)"
+    if [[ -n "$mtime" && -n "$now" ]] && (( now - mtime > 120 )); then
+      return 0                                  # stale request — the pane was busy; drop it
+    fi
+    print -r -- "$(command date '+%F %T') IN-PLACE pane=$WARP_TERMINAL_SESSION_UUID -> $cmd" \
+      >> "$recov/resume.log" 2>/dev/null
+    zle -I 2>/dev/null                          # let the line editor repaint around us
+    eval "$cmd"
   }
 fi
 
@@ -139,8 +201,16 @@ if [[ -o interactive ]] \
     #    the agent-appropriate resume form; run as a CHILD so the pane always survives.
     base=( "${(@)parts[3,-1]}" )
     (( ${#base} )) || base=( "$agent" )
-    if (( is_warp )) && [[ "$agent" == claude ]] && (( ${#base} == 1 )) && whence -w cc >/dev/null 2>&1; then
-      base=( cc all )   # user wrapper; if it fails at cold boot -> non-zero -> lock released -> reopen retries
+    # Prefer the user's own `cc` wrapper (it sets up their env/routing). It must be a
+    # FUNCTION or ALIAS they defined — every Mac with Xcode has a `cc` on PATH that is the C
+    # compiler, so a bare "does cc exist" test passes on machines with no wrapper at all and
+    # would hand the pane to clang instead of the agent.
+    local _ccw
+    if (( is_warp )) && [[ "$agent" == claude ]] && (( ${#base} == 1 )); then
+      _ccw="$(whence -w cc 2>/dev/null)"
+      if [[ "$_ccw" == *": function" || "$_ccw" == *": alias" ]]; then
+        base=( cc all )
+      fi
     fi
     case "$agent" in
       claude|gemini) base+=( --resume "$sid" ) ;;
@@ -176,7 +246,18 @@ if [[ -o interactive ]] \
     #
     # So we let startup finish, then type the command at the first prompt exactly as you
     # would have. The pane becomes a normal prompt running a normal command.
-    typeset -g _SUPERSET_RESUME_CMD="${(j: :)${(q)base[@]}}"
+    # Wait for a start slot first, so restoring 30 panes brings a few agents up at a time
+    # instead of all of them at once. This belongs on the command LINE, not inside the widget
+    # below: a widget that blocks freezes the line editor, which is the same class of bug as
+    # the inline launch described above. As a normal foreground command it is interruptible —
+    # Ctrl-C returns 130 and `&&` then simply skips the launch, leaving a plain shell.
+    #
+    # Absolute path, and only when it is really there: resolving this through PATH would mean
+    # a PATH hiccup returns "command not found", `&&` swallows the launch, and NOTHING resumes.
+    # A throttle must never be able to fail closed.
+    local _wait=""
+    [[ -x "$recov/superset-resume" ]] && _wait="${(q)recov}/superset-resume wait-slot && "
+    typeset -g _SUPERSET_RESUME_CMD="${_wait}${(j: :)${(q)base[@]}}"
     _superset_resume_kick() {
       emulate -L zsh
       # one-shot: never fire again in this shell, even if the launch fails
