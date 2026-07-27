@@ -8,6 +8,7 @@ Every conversation is still on disk; this makes them findable and one keystroke 
   sess                 recent conversations (last 24h), newest first
   sess -d 7            last 7 days
   sess -a              all
+  sess --lost          ONLY the ones no pane knows about — your restore checklist
   sess <text>          only ones whose first message matches <text>
   sess .               only ones from THIS folder
   sess <N>             reopen #N here (runs your `cc all --resume <id>`, or claude)
@@ -78,17 +79,45 @@ def sessions(days=1.0, match=None, here=False):
     return rows
 
 
+def claimed_sids():
+    """Sessions that already have a pane of their own (a saved pane<->session record).
+    Lets you see, at a glance, which conversations are homed and which are still
+    orphaned — so restoring a workspace is a checklist, not a guessing game."""
+    out = {}
+    base = os.path.join(HOME, ".superset-recovery")
+    for sub in ("warp-bindings", "warp-last"):
+        d = os.path.join(base, sub)
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for pane in names:
+            try:
+                parts = open(os.path.join(d, pane)).read().strip().split("\t")
+            except OSError:
+                continue
+            if len(parts) > 1:
+                out.setdefault(parts[1], pane)
+    return out
+
+
 def show(rows):
+    claimed = claimed_sids()
     if not rows:
-        print("No conversations found. Try a wider window:  sess -d 7   |   sess -a")
+        print("Nothing to show. Try a wider window:  sess -d 7   |   sess -a")
         return
     width = shutil.get_terminal_size((120, 24)).columns
-    print(f"\n  {len(rows)} conversation(s) — reopen one with:  sess <number>\n")
+    n_lost = sum(1 for r in rows if os.path.basename(r[1])[:-6] not in claimed)
+    print(f"\n  {len(rows)} conversation(s) — {n_lost} not yet in any pane. "
+          f"Reopen one with:  sess <number>")
+    print("  ● = has a pane      ○ = orphaned (no pane knows about it)\n")
     for i, (m, f, proj, lb) in enumerate(rows, 1):
+        sid = os.path.basename(f)[:-6]
+        mark = "●" if sid in claimed else "○"
         when = time.strftime("%a %H:%M", time.localtime(m))
         folder = proj.replace("-Users-maxkrasnykh-", "~/").replace("-Users-maxkrasnykh", "~")
-        room = max(20, width - 34 - len(folder))
-        print(f"  {i:>3}. {when:>9}  {folder[:30]:30}  {lb[:room]}")
+        room = max(20, width - 36 - len(folder))
+        print(f"  {i:>3}. {mark} {when:>9}  {folder[:30]:30}  {lb[:room]}")
     print()
 
 
@@ -110,6 +139,7 @@ def resume(rows, n, print_only=False):
 def main():
     args = [a for a in sys.argv[1:]]
     days, match, here, print_only = 1.0, None, False, False
+    only_lost = False
     pick = None
     i = 0
     while i < len(args):
@@ -124,6 +154,8 @@ def main():
             print_only = True
         elif a == ".":
             here = True
+        elif a in ("--lost", "-l"):
+            only_lost = True          # only conversations with no pane = your restore queue
         elif a.isdigit():
             pick = int(a)
         elif a in ("-h", "--help"):
@@ -135,6 +167,12 @@ def main():
     # and `sess 7` reopens a different conversation than the one you read. So pass the
     # same flags when picking (e.g. `sess -d 7 3`).
     rows = sessions(days=days, match=match, here=here)
+    # Apply --lost BEFORE both listing and picking, so the numbers you read are the
+    # numbers you pick. (Filtering only in show() made `sess --lost 3` open a different
+    # conversation than the #3 printed.)
+    if only_lost:
+        claimed = claimed_sids()
+        rows = [r for r in rows if os.path.basename(r[1])[:-6] not in claimed]
     if pick is not None:
         return resume(rows, pick, print_only)
     show(rows)
