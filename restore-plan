@@ -7,16 +7,21 @@ Writes a Warp Launch Configuration: a window of tabs, each split into panes, eac
 opening one conversation. You then run it once from Warp's command palette and every
 session comes back, each in its own pane, grouped by project.
 
-  restore-plan                 plan the ORPHANED conversations from the last 24h
-  restore-plan -d 3            last 3 days
+  restore-plan                 TICK THE ONES YOU WANT from the last 24h, then Enter.
+                               (space toggles · a all · n none · / filter · q cancels)
+  restore-plan -d 3            look back 3 days instead
+  restore-plan --all           skip the checkboxes, take the whole window
   restore-plan --all-known     include ones that already have a pane (default: skip)
   restore-plan --per-tab 3     group N sessions per tab as split panes
                                (default 1 = one tab per session, tab named after it)
   restore-plan --name X        launch-configuration name (default: restore-sessions)
   restore-plan --dry-run       print the plan, write nothing
-  restore-plan --limit 12      only the 12 most recent (the whole window is usually too many)
+  restore-plan --limit 12      non-interactive: the 12 most recent
   restore-plan --match gmail   only conversations whose name or folder matches
-  restore-plan --pick 1,4,7-9  only these rows from the numbered list (run once to see it)
+  restore-plan --pick 1,4,7-9  non-interactive: these rows from the printed list
+
+Never offers a conversation that is open right now — reopening one makes both copies
+write to the same transcript at once, which corrupts it.
 
 Then in Warp:  ⌘P → "Launch Configuration" → pick the name it prints.
 """
@@ -208,6 +213,116 @@ def build(rows, per_tab, name, launcher):
     return "\n".join(lines) + "\n", n_panes
 
 
+def choose(rows):
+    """Tick the conversations you want back. Space toggles, Enter confirms.
+
+    A time window is not a workspace. Asking for "everything from the last 24h" gives you
+    46 tabs; asking for them one at a time is just typing the resume yourself. What you
+    actually want is to look at the list and point at six of them — so this is that list,
+    with checkboxes.
+
+    Returns the chosen rows, or None if you backed out (which must open nothing)."""
+    import curses
+
+    picked = set()
+    state = {"cancel": False}
+
+    def ui(stdscr):
+        curses.curs_set(0)
+        try:
+            curses.use_default_colors()
+        except curses.error:
+            pass
+        top, cur, filt = 0, 0, ""
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            shown = [i for i, r in enumerate(rows)
+                     if not filt or filt.lower() in r[3].lower()
+                     or filt.lower() in os.path.basename(r[2]).lower()]
+            if not shown:
+                shown = []
+            body = max(1, h - 4)
+            if cur >= len(shown):
+                cur = max(0, len(shown) - 1)
+            if cur < top:
+                top = cur
+            if cur >= top + body:
+                top = cur - body + 1
+
+            head = f" {len(picked)} selected of {len(rows)}"
+            if filt:
+                head += f"   filter: {filt}"
+            stdscr.addnstr(0, 0, head.ljust(w - 1), w - 1, curses.A_BOLD)
+            stdscr.addnstr(1, 0, " space toggle · a all · n none · / filter · enter open · q cancel"
+                           .ljust(w - 1), w - 1, curses.A_DIM)
+
+            for line, idx in enumerate(shown[top:top + body]):
+                m, sid, cwd, label = rows[idx]
+                mark = "x" if idx in picked else " "
+                when = time.strftime("%a %H:%M", time.localtime(m))
+                folder = os.path.basename(cwd)[:20]
+                text = f" [{mark}] {when:>9}  {folder:20}  {label}"
+                attr = curses.A_REVERSE if idx == shown[cur] else curses.A_NORMAL
+                stdscr.addnstr(2 + line, 0, text.ljust(w - 1), w - 1, attr)
+
+            stdscr.refresh()
+            try:
+                k = stdscr.getch()
+            except KeyboardInterrupt:
+                state["cancel"] = True
+                return
+
+            if k in (curses.KEY_DOWN, ord("j")):
+                cur = min(cur + 1, max(0, len(shown) - 1))
+            elif k in (curses.KEY_UP, ord("k")):
+                cur = max(cur - 1, 0)
+            elif k == curses.KEY_NPAGE:
+                cur = min(cur + body, max(0, len(shown) - 1))
+            elif k == curses.KEY_PPAGE:
+                cur = max(cur - body, 0)
+            elif k == ord(" "):
+                if shown:
+                    i = shown[cur]
+                    picked.discard(i) if i in picked else picked.add(i)
+                    cur = min(cur + 1, len(shown) - 1)     # ticking runs down the list
+            elif k == ord("a"):
+                picked.update(shown)
+            elif k == ord("n"):
+                for i in shown:
+                    picked.discard(i)
+            elif k == ord("/"):
+                # Type to narrow; Enter accepts the filter, Esc clears it.
+                buf = ""
+                while True:
+                    stdscr.addnstr(h - 1, 0, ("/" + buf).ljust(w - 1), w - 1)
+                    stdscr.refresh()
+                    c = stdscr.getch()
+                    if c in (10, 13):
+                        break
+                    if c == 27:
+                        buf = ""
+                        break
+                    if c in (curses.KEY_BACKSPACE, 127, 8):
+                        buf = buf[:-1]
+                    elif 32 <= c < 127:
+                        buf += chr(c)
+                filt, cur, top = buf, 0, 0
+            elif k in (10, 13):
+                return
+            elif k in (ord("q"), 27):
+                state["cancel"] = True
+                return
+
+    try:
+        curses.wrapper(ui)
+    except Exception:
+        return "NOUI"          # no usable terminal — caller falls back to the printed list
+    if state["cancel"]:
+        return None
+    return [rows[i] for i in sorted(picked)]
+
+
 def parse_pick(spec, n):
     """"1,4,7-9" -> the row numbers you actually want, 1-based, in list order.
 
@@ -243,6 +358,7 @@ def main():
     a = sys.argv[1:]
     days, per_tab, name, dry, include_known = 1.0, 1, "restore-sessions", False, False
     limit, match, pick = 0, "", ""
+    interactive = True
     i = 0
     while i < len(a):
         if a[i] == "-d" and i + 1 < len(a):
@@ -261,6 +377,8 @@ def main():
             i += 1; name = a[i]
         elif a[i] == "--dry-run":
             dry = True
+        elif a[i] in ("--no-ui", "--all"):
+            interactive = False          # take the whole window, no checkboxes
         elif a[i] == "--all-known":
             include_known = True
         elif a[i] in ("-h", "--help"):
@@ -282,6 +400,21 @@ def main():
     total = len(rows)
     if match:
         rows = [r for r in rows if match in r[3].lower() or match in os.path.basename(r[2]).lower()]
+
+    # Checkboxes are the natural way to answer "which of these do you want back", so that is
+    # the default when you are sitting at a terminal and haven't already said which ones.
+    # Piped or scripted (not a tty), or narrowed explicitly, it stays non-interactive.
+    if interactive and not pick and not limit and sys.stdin.isatty() and sys.stdout.isatty():
+        chosen = choose(rows)
+        if chosen is None:
+            print("\n  Cancelled — nothing written, nothing opened.\n")
+            return 0
+        if chosen != "NOUI":
+            if not chosen:
+                print("\n  Nothing ticked — nothing written.\n")
+                return 0
+            rows = chosen
+
     if pick:
         want = parse_pick(pick, len(rows))
         if not want:
