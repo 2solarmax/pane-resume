@@ -22,6 +22,23 @@
 # burned and can retry. The agent runs as a CHILD (never exec), so if it exits/fails the
 # pane falls back to a normal shell rather than dying.
 
+# ── PANE LABEL (runs ALWAYS — even disarmed, even when nothing is resumed) ────────
+# Warp labels every pane with its working directory, which is identical across dozens of
+# panes and tells you nothing. After a crash you get N restored panes and no way to know
+# what each one held. So each pane re-labels itself from its own saved record: the topic
+# of the conversation it was running. This is the half that must work even when the
+# session is NOT auto-restored — you can then reopen it deliberately (`sess`).
+if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \
+   && [[ "$TERM_PROGRAM" == "WarpTerminal" ]] \
+   && [[ "$WARP_TERMINAL_SESSION_UUID" =~ '^[0-9a-fA-F]{32}$' ]]; then
+  () {
+    emulate -L zsh
+    local lbl
+    lbl="$(command python3 "$HOME/.superset-recovery/resume-lib.py" pane-label "$WARP_TERMINAL_SESSION_UUID" 2>/dev/null)"
+    [[ -n "$lbl" ]] && print -n -- $'\033]0;'"${lbl[1,60]}"$'\007'
+  }
+fi
+
 if [[ -o interactive ]] \
    && [[ -z "$CLAUDECODE" ]] \
    && [[ -z "$_SUPERSET_RESUME_DONE" ]] \

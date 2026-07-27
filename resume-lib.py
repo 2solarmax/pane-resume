@@ -579,6 +579,25 @@ if __name__ == "__main__":
         print(boot_id())
     elif cmd == "warp-epoch":
         print(warp_epoch())
+    elif cmd == "label" and len(sys.argv) >= 3:
+        print(_label(sys.argv[2]))
+    elif cmd == "pane-label" and len(sys.argv) >= 3:
+        # What WAS this pane running? Reads the durable record, prints a human topic.
+        # Used to re-label a restored-but-empty pane, so after a crash every pane still
+        # says which conversation it held (Warp shows only the cwd, identical everywhere).
+        u = sys.argv[2]
+        out = ""
+        if WARP_UUID_RE.match(u or ""):
+            for d in (WARP_BINDINGS, WARP_LAST):
+                try:
+                    parts = open(os.path.join(d, u)).read().strip().split("\t")
+                    if len(parts) > 1:
+                        out = _label(parts[1]) or ""
+                        if out:
+                            break
+                except OSError:
+                    continue
+        print(out)
     elif cmd == "native":
         print("1" if native_resume_present() else "0")
     elif cmd == "agent-running" and len(sys.argv) >= 3:
