@@ -71,24 +71,13 @@ def main():
                          % (__import__("time").strftime("%F %T"), uuid[:8], reason))
         except Exception:
             pass
-        # ONLY a deliberate, user-initiated exit clears the live binding. Anything else
-        # (crash, SIGHUP, app quit, "other") LEAVES it, so the pane still resumes.
-        if reason not in ("prompt_input_exit", "logout", "clear"):
-            return
-        try:
-            with open(bpath) as fh:
-                rec = fh.read().strip().split("\t")
-        except OSError:
-            return
-        rec_sid = rec[1] if len(rec) > 1 else ""
-        # Remove only if this binding is for the ending session (so a different live
-        # session that re-bound this pane is never clobbered). The durable warp-last
-        # record is intentionally NOT touched.
-        if not ending or rec_sid == ending:
-            try:
-                os.remove(bpath)
-            except OSError:
-                pass
+        # NEVER remove the record. Max, 2026-07-27: "It doesn't matter who quits it, I or
+        # somebody else. I need to be able to restore every session in the exact pane where
+        # it was." So a session that ends — for ANY reason, including a deliberate quit —
+        # stays restorable in its own pane. The record is only ever REPLACED, by the next
+        # SessionStart in that same pane. Losing a pane's session is the failure mode that
+        # matters; re-opening one you'd finished is a keystroke to close.
+        return
 
 
 if __name__ == "__main__":
