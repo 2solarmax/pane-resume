@@ -190,13 +190,32 @@ def resolve(term_id, ws_id):
 
 
 def _label(sid):
-    """Human label = first real user message, located by the globally-unique sid
-    (no fragile reconstruction of Claude's project-dir encoding)."""
+    """Human label = the conversation's real NAME (`ai-title`/`aiTitle` — what Claude
+    shows you), falling back to its first user message if it hasn't been named yet.
+    Located by the globally-unique sid (no fragile project-dir encoding)."""
     m = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", f"{sid}.jsonl"))
     if not m:
         return ""
     try:
-        import json
+        named = ""
+        with open(m[0], "r", errors="ignore") as fh:
+            for line in fh:
+                if '"ai-title"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get("type") == "ai-title":
+                    named = o.get("aiTitle") or named
+        if named:
+            return " ".join(named.split())[:60]
+    except Exception:
+        pass
+    try:
+        # NOTE: no `import json` here — json is imported at module scope. A function-local
+        # import would make `json` local to this WHOLE function, so the ai-title lookup
+        # above would raise UnboundLocalError and silently fall through to this fallback.
         with open(m[0], "r", errors="ignore") as fh:
             for line in fh:
                 try:

@@ -23,7 +23,25 @@ PROJ = os.path.join(HOME, ".claude", "projects")
 
 
 def label(path, limit=72):
-    """First real user message = what this conversation is about."""
+    """The conversation's real NAME — the same title Claude shows you (`ai-title` /
+    `aiTitle` in the transcript, kept current as the session evolves). Falls back to the
+    first user message only when a session has no name yet."""
+    named = ""
+    try:
+        with open(path, errors="ignore") as fh:
+            for line in fh:
+                if '"ai-title"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get("type") == "ai-title":
+                    named = o.get("aiTitle") or named   # last one wins = most current
+    except Exception:
+        pass
+    if named:
+        return " ".join(named.split())[:limit]
     try:
         with open(path, errors="ignore") as fh:
             for i, line in enumerate(fh):
