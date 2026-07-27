@@ -13,7 +13,7 @@ END="# <<< superset-recovery <<<"
 echo "Installing pane-resume → $DEST"
 mkdir -p "$DEST"
 cp "$SRC/resume-lib.py" "$SRC/resume-hook.zsh" "$SRC/superset-resume" \
-   "$SRC/warp-session-hook.py" "$SRC/pane-title.py" \
+   "$SRC/warp-session-hook.py" "$SRC/pane-title.py" "$SRC/titlelib.py" \
    "$SRC/restore-plan" "$SRC/restore-in-place" "$DEST/"
 chmod +x "$DEST/superset-resume" "$DEST/resume-lib.py" "$DEST/warp-session-hook.py" \
          "$DEST/pane-title.py" "$DEST/restore-plan" "$DEST/restore-in-place"

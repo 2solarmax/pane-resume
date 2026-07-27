@@ -18,6 +18,15 @@ MAX = 60          # headers are wide; 60 chars reads well without crowding the c
 HOME = os.path.expanduser("~")
 PROJ = os.path.join(HOME, ".claude", "projects")
 
+# The naming rule is shared with restore-plan, so a live pane and the tab that comes back
+# after a restart carry the SAME name — and both agree with Claude Code's own. Imported
+# defensively: this runs as a hook, and a missing file must cost a title, never a session.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import titlelib
+except Exception:
+    titlelib = None
+
 
 def set_title(text):
     """Write the OSC title to the pane's controlling terminal (not stdout — stdout is
@@ -92,11 +101,12 @@ def main():
 
     sid = data.get("session_id") or ""
     label = ""
-    # Prefer the conversation's own opening message (stable across the whole session).
+    # Call it what Claude Code calls it. A pane whose header says something different from
+    # the app's own session list is a pane you have to open to identify.
     tp = data.get("transcript_path") or (transcript_for(sid) if sid else "")
     if tp:
-        label = first_message(tp)
-    # Brand-new session: nothing written yet -> use the prompt being submitted.
+        label = titlelib.name_of(tp, MAX) if titlelib else first_message(tp)
+    # Brand-new session: unnamed, nothing written yet -> use the prompt being submitted.
     if not label:
         label = data.get("prompt") or ""
     if not label:

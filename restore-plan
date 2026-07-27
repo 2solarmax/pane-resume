@@ -24,98 +24,24 @@ PROJ = os.path.join(HOME, ".claude", "projects")
 RECOV = os.path.join(HOME, ".superset-recovery")
 LAUNCH_DIR = os.path.join(HOME, ".warp", "launch_configurations")
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import titlelib            # what to CALL a conversation — shared with pane-title.py
+
+# Working directories that are throwaway by construction. A conversation started in one
+# was about a temp file, not a project; its folder is usually gone by the time you would
+# restore it, and a tab named after a /var/folders path tells you nothing.
+TEMP_ROOTS = ("/var/folders/", "/private/var/folders/", "/tmp/", "/private/tmp/")
+
 
 def scan(path, limit=60):
-    """Read a transcript once: its real NAME, its own recorded cwd (authoritative — no
-    guessing from Claude's lossy directory encoding, which broke on worktrees), and how
-    many user messages it has (so one-shot throwaways can be skipped)."""
-    named = first = cwd = ""
-    users = 0
-    try:
-        with open(path, errors="ignore") as fh:
-            for line in fh:
-                if not cwd and '"cwd"' in line:
-                    try: cwd = json.loads(line).get("cwd", "") or ""
-                    except Exception: pass
-                if '"ai-title"' in line:
-                    try:
-                        o = json.loads(line)
-                        if o.get("type") == "ai-title":
-                            named = o.get("aiTitle") or named
-                    except Exception: pass
-                    continue
-                if '"type":"user"' in line.replace(" ", ""):
-                    users += 1
-                    if not first:
-                        try:
-                            o = json.loads(line)
-                            c = o.get("message", {}).get("content")
-                            t = c if isinstance(c, str) else (next(
-                                (p.get("text") for p in c if isinstance(p, dict)
-                                 and p.get("type") == "text"), None) if isinstance(c, list) else None)
-                            if t:
-                                t = " ".join(t.split())
-                                if t and t[0] != "<" and not t.startswith("Caveat"):
-                                    first = t
-                        except Exception: pass
-    except Exception:
-        pass
-    label = (" ".join((named or first).split()))[:limit] or "(unnamed)"
-    return label, cwd, users
+    """What to call a conversation, where it lived, and whether it is worth reopening.
 
-
-def real_name(path, limit=60):
-    """The conversation's own name (what Claude shows you), else its first message."""
-    named = ""
-    first = ""
-    try:
-        with open(path, errors="ignore") as fh:
-            for line in fh:
-                if '"ai-title"' in line:
-                    try:
-                        o = json.loads(line)
-                        if o.get("type") == "ai-title":
-                            named = o.get("aiTitle") or named
-                    except Exception:
-                        pass
-                elif not first and '"type":"user"' in line.replace(" ", ""):
-                    try:
-                        o = json.loads(line)
-                        c = o.get("message", {}).get("content")
-                        t = c if isinstance(c, str) else next(
-                            (p.get("text") for p in c if isinstance(p, dict)
-                             and p.get("type") == "text"), None) if isinstance(c, list) else None
-                        if t:
-                            t = " ".join(t.split())
-                            if t and t[0] != "<" and not t.startswith("Caveat"):
-                                first = t
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-    return (" ".join((named or first).split()))[:limit] or "(unnamed)"
-
-
-def decoded_cwd(projdir):
-    """Claude encodes the cwd by replacing every non-alphanumeric with '-', which is
-    lossy. Recover the real path by matching against directories that exist."""
-    cand = projdir.replace("-Users-", "/Users/", 1)
-    if os.path.isdir(cand):
-        return cand
-    parts = projdir.strip("-").split("-")
-    path = "/"
-    i = 0
-    while i < len(parts):
-        for j in range(len(parts), i, -1):
-            trial = os.path.join(path, " ".join(parts[i:j])) if False else os.path.join(path, "-".join(parts[i:j]))
-            alt = os.path.join(path, " ".join(parts[i:j]))
-            if os.path.isdir(trial):
-                path, i = trial, j; break
-            if os.path.isdir(alt):
-                path, i = alt, j; break
-        else:
-            return path if os.path.isdir(path) else HOME
-    return path
+    The cwd comes from the transcript's own record — authoritative. Deriving it from
+    Claude's lossy directory encoding instead is what used to break on worktrees, whose
+    names contain the very character the encoding replaces."""
+    tr = titlelib.read_transcript(path)
+    # Would rather say "(unnamed)" than invent a name out of a paste.
+    return titlelib.name_from(tr, limit, "(unnamed)"), tr.cwd, tr.users
 
 
 def claimed():
@@ -220,6 +146,8 @@ def collect(days, include_known):
             continue          # one-shot / throwaway session — nothing worth reopening
         if not cwd or not os.path.isdir(cwd):
             continue          # its folder is gone (deleted worktree) — can't reopen it there
+        if cwd.startswith(TEMP_ROOTS):
+            continue          # started in a temp dir — a throwaway, not a project
         rows.append((m, sid, cwd, label))
     rows.sort(reverse=True)
     return rows
