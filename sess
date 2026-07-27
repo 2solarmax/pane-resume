@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""
+sess — find and reopen a Claude conversation, by what it was ABOUT.
+
+Terminals lose which conversation was in which pane (a crash, a restart, a closed tab).
+Every conversation is still on disk; this makes them findable and one keystroke to reopen.
+
+  sess                 recent conversations (last 24h), newest first
+  sess -d 7            last 7 days
+  sess -a              all
+  sess <text>          only ones whose first message matches <text>
+  sess .               only ones from THIS folder
+  sess <N>             reopen #N here (runs your `cc all --resume <id>`, or claude)
+  sess <N> --print     just print the resume command, don't run it
+
+Reads ~/.claude/projects. Never deletes anything.
+"""
+import os, sys, json, glob, time, subprocess, shutil
+
+HOME = os.path.expanduser("~")
+PROJ = os.path.join(HOME, ".claude", "projects")
+
+
+def label(path, limit=72):
+    """First real user message = what this conversation is about."""
+    try:
+        with open(path, errors="ignore") as fh:
+            for i, line in enumerate(fh):
+                if i > 400:
+                    break
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get("type") != "user":
+                    continue
+                c = o.get("message", {}).get("content")
+                t = None
+                if isinstance(c, list):
+                    for p in c:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            t = p.get("text"); break
+                elif isinstance(c, str):
+                    t = c
+                if not t:
+                    continue
+                t = " ".join(t.split())
+                if not t or t[0] == "<" or t.startswith("Caveat") or t.startswith("[Request"):
+                    continue
+                return t[:limit]
+    except Exception:
+        pass
+    return "(no text yet)"
+
+
+def sessions(days=1.0, match=None, here=False):
+    cutoff = time.time() - days * 86400
+    cwd_enc = "".join(ch if ch.isalnum() else "-" for ch in os.getcwd())
+    out = []
+    for f in glob.glob(os.path.join(PROJ, "*", "*.jsonl")):
+        try:
+            m = os.path.getmtime(f)
+        except OSError:
+            continue
+        if m < cutoff:
+            continue
+        proj = os.path.basename(os.path.dirname(f))
+        if here and proj != cwd_enc:
+            continue
+        out.append((m, f, proj))
+    out.sort(reverse=True)
+    rows = []
+    for m, f, proj in out:
+        lb = label(f)
+        if match and match.lower() not in lb.lower() and match.lower() not in proj.lower():
+            continue
+        rows.append((m, f, proj, lb))
+    return rows
+
+
+def show(rows):
+    if not rows:
+        print("No conversations found. Try a wider window:  sess -d 7   |   sess -a")
+        return
+    width = shutil.get_terminal_size((120, 24)).columns
+    print(f"\n  {len(rows)} conversation(s) — reopen one with:  sess <number>\n")
+    for i, (m, f, proj, lb) in enumerate(rows, 1):
+        when = time.strftime("%a %H:%M", time.localtime(m))
+        folder = proj.replace("-Users-maxkrasnykh-", "~/").replace("-Users-maxkrasnykh", "~")
+        room = max(20, width - 34 - len(folder))
+        print(f"  {i:>3}. {when:>9}  {folder[:30]:30}  {lb[:room]}")
+    print()
+
+
+def resume(rows, n, print_only=False):
+    if not (1 <= n <= len(rows)):
+        print(f"No #{n}. Run `sess` to see the list."); return 1
+    m, f, proj, lb = rows[n - 1]
+    sid = os.path.basename(f)[:-6]
+    # Prefer the user's own wrapper so their env/router is set up the same as always.
+    has_cc = subprocess.run(["zsh", "-ic", "whence -w cc >/dev/null 2>&1"],
+                            capture_output=True).returncode == 0
+    cmd = f"cc all --resume {sid}" if has_cc else f"claude --resume {sid}"
+    if print_only:
+        print(cmd); return 0
+    print(f"\n  Reopening: {lb}\n  → {cmd}\n")
+    os.execvp("zsh", ["zsh", "-ic", cmd])
+
+
+def main():
+    args = [a for a in sys.argv[1:]]
+    days, match, here, print_only = 1.0, None, False, False
+    pick = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-a":
+            days = 3650
+        elif a == "-d" and i + 1 < len(args):
+            i += 1
+            try: days = float(args[i])
+            except ValueError: pass
+        elif a == "--print":
+            print_only = True
+        elif a == ".":
+            here = True
+        elif a.isdigit():
+            pick = int(a)
+        elif a in ("-h", "--help"):
+            print(__doc__); return 0
+        else:
+            match = a
+        i += 1
+    # NOTE: listing and picking MUST use the same window/filters, or the numbers shift
+    # and `sess 7` reopens a different conversation than the one you read. So pass the
+    # same flags when picking (e.g. `sess -d 7 3`).
+    rows = sessions(days=days, match=match, here=here)
+    if pick is not None:
+        return resume(rows, pick, print_only)
+    show(rows)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

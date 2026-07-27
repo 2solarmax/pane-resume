@@ -24,6 +24,10 @@ CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
 UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")       # claude/superset ids: 36-char dashed UUID
 WARP_UUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")   # Warp pane id: 32 hex, no dashes
 WARP_BINDINGS = os.path.join(RECOV, "warp-bindings")
+# Durable last-seen pane->session record. NEVER deleted by SessionEnd — the
+# crash-proof fallback (2026-07-27: a Warp crash fired SessionEnd on 23 live
+# sessions and wiped their bindings). resolve_warp falls back to this.
+WARP_LAST = os.path.join(RECOV, "warp-last")
 
 
 def host_db():
@@ -382,13 +386,19 @@ def resolve_warp(uuid):
     logged distinctly — 'no binding' after a restart means the uuid was NOT reused."""
     if not WARP_UUID_RE.match(uuid or ""):
         return ""
-    try:
-        with open(os.path.join(WARP_BINDINGS, uuid), "r") as fh:
-            parts = fh.read().strip().split("\t")
-    except OSError:
-        # no binding -> nothing was live in this pane -> no resume. (After a restart this
-        # also covers "Warp assigned a NEW pane uuid" — fail-closed, never a wrong resume.)
-        _wlog("no binding for pane %s — no resume (fresh pane, clean exit, or uuid not reused)" % uuid[:8])
+    parts, src = None, ""
+    for path, tag in ((os.path.join(WARP_BINDINGS, uuid), "live"),
+                      (os.path.join(WARP_LAST, uuid), "last-seen")):
+        try:
+            with open(path, "r") as fh:
+                parts = fh.read().strip().split("\t"); src = tag
+            break
+        except OSError:
+            continue
+    if parts is None:
+        # Neither record -> nothing ever ran in this pane -> no resume. (After a restart
+        # this also covers "Warp assigned a NEW pane uuid" — fail-closed, never wrong.)
+        _wlog("no record for pane %s — no resume (fresh pane or uuid not reused)" % uuid[:8])
         return ""
     if len(parts) < 2:
         _wlog("malformed binding for pane %s — no resume" % uuid[:8])
@@ -492,12 +502,17 @@ def bootstrap_warp():
         cwd = _proc_cwd(p[0]) or HOME
         if not _transcript_exists("claude", cwd, sid):
             continue
-        try:
-            with open(os.path.join(WARP_BINDINGS, uuid), "w") as fh:
-                fh.write("%s\t%s\n" % (cwd, sid))
+        wrote = False
+        for d in (WARP_BINDINGS, WARP_LAST):
+            try:
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, uuid), "w") as fh:
+                    fh.write("%s\t%s\n" % (cwd, sid))
+                wrote = True
+            except OSError:
+                pass
+        if wrote:
             n += 1
-        except OSError:
-            pass
     return n
 
 
