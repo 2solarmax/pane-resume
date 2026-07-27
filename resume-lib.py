@@ -18,6 +18,9 @@ Commands:
 """
 import sys, os, glob, sqlite3, subprocess, re, time, json
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import titlelib            # what to CALL a conversation — one rule, every surface
+
 HOME = os.path.expanduser("~")
 RECOV = os.path.join(HOME, ".superset-recovery")
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
@@ -190,54 +193,20 @@ def resolve(term_id, ws_id):
 
 
 def _label(sid):
-    """Human label = the conversation's real NAME (`ai-title`/`aiTitle` — what Claude
-    shows you), falling back to its first user message if it hasn't been named yet.
+    """Human label = the conversation's real NAME — the same one Claude Code shows you, the
+    pane header shows while it runs, and a restored tab carries.
+
+    This is the label a pane wears AFTER A CRASH, when the conversation is no longer running
+    in it. It is the last thing standing between you and a wall of identically-named panes,
+    so it uses the shared rule rather than a private copy of it: an earlier private copy here
+    would title a pane `command-args>` (a slash command's own envelope), throw away a
+    conversation held in Russian, and pass raw ANSI into the title escape.
+
     Located by the globally-unique sid (no fragile project-dir encoding)."""
     m = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", f"{sid}.jsonl"))
     if not m:
         return ""
-    try:
-        named = ""
-        with open(m[0], "r", errors="ignore") as fh:
-            for line in fh:
-                if '"ai-title"' not in line:
-                    continue
-                try:
-                    o = json.loads(line)
-                except Exception:
-                    continue
-                if o.get("type") == "ai-title":
-                    named = o.get("aiTitle") or named
-        if named:
-            return " ".join(named.split())[:60]
-    except Exception:
-        pass
-    try:
-        # NOTE: no `import json` here — json is imported at module scope. A function-local
-        # import would make `json` local to this WHOLE function, so the ai-title lookup
-        # above would raise UnboundLocalError and silently fall through to this fallback.
-        with open(m[0], "r", errors="ignore") as fh:
-            for line in fh:
-                try:
-                    o = json.loads(line)
-                except Exception:
-                    continue
-                if o.get("type") == "user":
-                    c = o.get("message", {}).get("content")
-                    txt = None
-                    if isinstance(c, list):
-                        for p in c:
-                            if isinstance(p, dict) and p.get("type") == "text":
-                                txt = p["text"]; break
-                    elif isinstance(c, str):
-                        txt = c
-                    if txt:
-                        t = " ".join(txt.split())
-                        if t and t[0] not in "<" and not t.startswith("Caveat"):
-                            return t[:60]
-    except Exception:
-        pass
-    return ""
+    return titlelib.name_of(m[0], 60)
 
 
 def live_terminal_ids():
@@ -610,12 +579,23 @@ if __name__ == "__main__":
             for d in (WARP_BINDINGS, WARP_LAST):
                 try:
                     parts = open(os.path.join(d, u)).read().strip().split("\t")
-                    if len(parts) > 1:
-                        out = _label(parts[1]) or ""
-                        if out:
-                            break
                 except OSError:
                     continue
+                if len(parts) < 2:
+                    continue
+                cwd, sid = parts[0], parts[1]
+                out = _label(sid)
+                if out:
+                    break
+                # No name available — the conversation was never named and never used, or
+                # its transcript has since been deleted. Do NOT fall through to nothing:
+                # an unlabelled pane reverts to Warp's own label, the working directory,
+                # which is identical across dozens of panes and is the whole reason this
+                # exists. The folder plus a short id is at least unique per pane.
+                short = os.path.basename(cwd.rstrip("/")) or cwd
+                if short or sid:
+                    out = f"{short} · {sid[:8]}".strip(" ·")
+                    break
         print(out)
     elif cmd == "native":
         print("1" if native_resume_present() else "0")
