@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installer for superset-session-resume.
+# Installer for pane-resume.
 # Copies the tool to ~/.superset-recovery, wires a guarded block into ~/.zshrc,
 # and leaves it DISARMED (opt-in). Idempotent — safe to re-run to update.
 set -euo pipefail
@@ -10,7 +10,7 @@ ZSHRC="$HOME/.zshrc"
 BEGIN="# >>> superset-recovery >>>"
 END="# <<< superset-recovery <<<"
 
-echo "Installing superset-session-resume → $DEST"
+echo "Installing pane-resume → $DEST"
 mkdir -p "$DEST"
 cp "$SRC/resume-lib.py" "$SRC/resume-hook.zsh" "$SRC/superset-resume" \
    "$SRC/warp-session-hook.py" "$DEST/"

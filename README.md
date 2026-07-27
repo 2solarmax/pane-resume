@@ -1,4 +1,4 @@
-# superset-session-resume
+# pane-resume
 
 Auto-resume your terminal's agent conversations after a **full Mac restart**. Supports **[Warp](https://warp.dev)** and **[Superset](https://superset.sh)**.
 
@@ -25,6 +25,18 @@ Every agent CLI already persists its conversation (`~/.claude/projects/…`, `~/
 
 **Warp support is Claude-only for now** (codex/gemini in Warp: coming). Superset supports claude/codex/gemini.
 
+### Adding a terminal
+
+A terminal is an adapter, not a fork. To support one, implement three things in `resume-lib.py`:
+
+| Contract | Warp | Superset |
+|---|---|---|
+| **Pane identity** — an env var the terminal sets in each pane and *reuses* after a cold restore | `WARP_TERMINAL_SESSION_UUID` | `SUPERSET_TERMINAL_ID` |
+| **`resolve*(pane_id)`** — returns `agent \t session_id \t [launcher…]`, or nothing | `resolve_warp()` | `resolve()` |
+| **Epoch** — an id for "this run of the terminal", so locks from a previous run are reaped | `warp_epoch()` | `boot_id()` |
+
+Everything else — arming, locking, the launch-at-first-prompt widget, the in-place SIGUSR1 path, pane titling — is terminal-agnostic and shared. If a terminal can't supply a stable pane identity across a restart, it can't be supported: that identity is the whole basis for putting the *right* conversation back in the *right* pane.
+
 ## Requirements
 
 macOS · `zsh` panes · Warp and/or Superset · `python3` + `sqlite3` (both ship with macOS).
@@ -32,8 +44,8 @@ macOS · `zsh` panes · Warp and/or Superset · `python3` + `sqlite3` (both ship
 ## Install
 
 ```bash
-git clone https://github.com/2solarmax/superset-session-resume.git
-cd superset-session-resume && ./install.sh
+git clone https://github.com/2solarmax/pane-resume.git
+cd pane-resume && ./install.sh
 ```
 
 The installer copies the files to `~/.superset-recovery/`, adds a small guarded block to your `~/.zshrc`, and leaves it **disarmed** (opt-in). For Warp, also register the session-binding hook in `~/.claude/settings.json` (append, don't replace):
