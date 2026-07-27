@@ -181,7 +181,10 @@ def build(rows, per_tab, name, launcher):
     by_proj = {}
     for m, sid, cwd, label in rows:
         by_proj.setdefault(cwd, []).append((sid, label))
-    lines = [MARKER, "---", f"name: {name}", "windows:", "  - tabs:"]
+    # The marker goes AFTER the document start, never before it. A comment ahead of `---` is
+    # legal YAML but it is the kind of thing a strict reader rejects, and this file is parsed
+    # by Warp, not by us — the ownership marker must not be able to cost you the restore.
+    lines = ["---", MARKER, f"name: {name}", "windows:", "  - tabs:"]
     n_panes = 0
     for cwd, items in by_proj.items():
         short = os.path.basename(cwd) or cwd
@@ -489,12 +492,17 @@ def main():
     saved = ""
     if os.path.exists(path):
         try:
-            head = open(path, errors="ignore").readline()
+            with open(path, errors="ignore") as fh:
+                head = "".join(fh.readline() for _ in range(3))   # marker sits just under ---
         except OSError:
             head = MARKER          # unreadable -> treat as ours rather than block recovery
         if MARKER not in head:
-            saved = path + ".bak"
+            # Backed up into OUR directory, never into Warp's. That folder is Warp's to
+            # enumerate; leaving `.bak` debris in it is our mess in someone else's drawer.
+            bdir = os.path.join(RECOV, "backups")
             try:
+                os.makedirs(bdir, exist_ok=True)
+                saved = os.path.join(bdir, os.path.basename(path) + ".bak")
                 os.replace(path, saved)
             except OSError:
                 saved = ""
