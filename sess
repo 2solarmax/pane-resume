@@ -102,14 +102,55 @@ def show(rows):
     print()
 
 
+def already_open(sid):
+    """Is this conversation running somewhere right now?
+
+    Two copies of one conversation both append to the same transcript and interleave it into
+    nonsense. The other two restore paths have always checked; this one — the one you reach
+    for most, because it is the one you type — did not. Uses the SAME definition of "open"
+    rather than a second one, so there is no way for them to disagree.
+
+    Unknown (the probe failed) is reported as unknown, not as safe."""
+    try:
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        p = os.path.join(HOME, ".superset-recovery", "restore-plan")
+        spec = importlib.util.spec_from_file_location(
+            "restore_plan", p, loader=SourceFileLoader("restore_plan", p))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        busy = mod.busy_sids()
+    except Exception:
+        return None
+    if busy is None:
+        return None
+    return sid in busy
+
+
 def resume(rows, n, print_only=False):
     if not (1 <= n <= len(rows)):
         print(f"No #{n}. Run `sess` to see the list."); return 1
     m, f, proj, lb = rows[n - 1]
     sid = os.path.basename(f)[:-6]
+    if not print_only:
+        state = already_open(sid)
+        if state is True:
+            print(f"\n  Not reopening \"{lb}\" — it is open in another pane right now.")
+            print("  Two copies of one conversation write to the same transcript at once,")
+            print("  which corrupts it. Find that pane, or pick another number.\n")
+            return 1
+        if state is None:
+            # Deliberately NOT fatal: you asked for this one conversation by name, and a
+            # broken probe must not be able to lock you out of your own recovery.
+            print("\n  (Could not check whether this conversation is open elsewhere —")
+            print("   if it is already running in another pane, close that one first.)")
     # Prefer the user's own wrapper so their env/router is set up the same as always.
-    has_cc = subprocess.run(["zsh", "-ic", "whence -w cc >/dev/null 2>&1"],
-                            capture_output=True).returncode == 0
+    # `whence -w cc` alone is NOT enough: every Mac with Xcode has /usr/bin/cc (the C
+    # compiler), so a bare existence test passes and we would hand the resume to a compiler.
+    has_cc = subprocess.run(
+        ["zsh", "-ic", "w=$(whence -w cc 2>/dev/null); "
+                       "[[ \"$w\" == *': function' || \"$w\" == *': alias' ]]"],
+        capture_output=True).returncode == 0
     cmd = f"cc all --resume {sid}" if has_cc else f"claude --resume {sid}"
     if print_only:
         print(cmd); return 0
