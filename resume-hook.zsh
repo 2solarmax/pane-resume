@@ -163,17 +163,46 @@ if [[ -o interactive ]] \
     local -i _drained=0
     while (( _drained < 4096 )) && read -s -t -k 1 2>/dev/null; do (( _drained++ )); done
     (( _drained )) && print -r -- "$(command date '+%F %T')   -> drained ${_drained} type-ahead char(s)" >> "$log" 2>/dev/null
-    print -r -- "$(command date '+%F %T')   -> exec: $base[*]" >> "$log" 2>/dev/null
-    "$base[@]"
-    local rc=$?
-    # DO NOT release the lock on failure. Releasing it created a tight relaunch loop
-    # (2026-07-27): launcher fails -> lock released -> the pane's next shell resumes ->
-    # fails -> ... and the same path re-launched a session the user had just quit. The
-    # one-shot now holds for the whole Warp run; a failed launch leaves a normal shell and
-    # is reported here. Re-run it yourself, or it resumes on the next Warp start.
-    if (( rc != 0 )); then
-      print -r -- "$(command date '+%F %T')   -> launcher exit rc=$rc; left as shell (no auto-retry)" >> "$log" 2>/dev/null
+    print -r -- "$(command date '+%F %T')   -> queued: $base[*]" >> "$log" 2>/dev/null
+
+    # Hand the pane to the agent only AFTER the shell has finished starting up.
+    #
+    # Running it here instead is the obvious thing to do and it is wrong: .zshrc would then
+    # never return for as long as the session lives, so zsh never reaches its first prompt
+    # and the terminal keeps reporting the shell as still starting — Warp shows a permanent
+    # "Starting zsh …" on every restored pane, plus "your shell is taking a while to start",
+    # and treats the pane as not-yet-ready. Measured on a pty: launching inline, the prompt
+    # appears only once the child EXITS; deferred to the first prompt, it appears in 0.02s.
+    #
+    # So we let startup finish, then type the command at the first prompt exactly as you
+    # would have. The pane becomes a normal prompt running a normal command.
+    typeset -g _SUPERSET_RESUME_CMD="${(j: :)${(q)base[@]}}"
+    _superset_resume_kick() {
+      emulate -L zsh
+      # one-shot: never fire again in this shell, even if the launch fails
+      if (( $+functions[add-zle-hook-widget] )); then
+        add-zle-hook-widget -d line-init _superset_resume_kick 2>/dev/null
+      else
+        zle -D zle-line-init 2>/dev/null
+      fi
+      [[ -n "$_SUPERSET_RESUME_CMD" ]] || return 0
+      BUFFER="$_SUPERSET_RESUME_CMD"
+      unset _SUPERSET_RESUME_CMD
+      zle accept-line
+    }
+    # Prefer the composing hook so a plugin's own line-init widget still runs; fall back to
+    # defining the widget directly on shells without it.
+    autoload -Uz add-zle-hook-widget 2>/dev/null
+    if (( $+functions[add-zle-hook-widget] )) \
+       && add-zle-hook-widget line-init _superset_resume_kick 2>/dev/null; then
+      :
+    else
+      zle -N zle-line-init _superset_resume_kick
     fi
+    # The lock is deliberately NOT released if the launch fails. Releasing it created a tight
+    # relaunch loop (2026-07-27): launcher fails -> lock released -> the pane's next shell
+    # resumes -> fails -> ... and it re-launched a session the user had just quit. The
+    # one-shot holds for the whole Warp run; a failed launch leaves a normal shell.
     return 0
   }
   # NOTE: no block-level 2>/dev/null — the resumed agent must keep its stderr so a failed
