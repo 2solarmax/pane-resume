@@ -220,8 +220,7 @@ def build_tab_configs(rows, launcher_for):
         g = (guard % sid) if guard else ""
         stem = "restore_" + sid[:8]
         body = (MARKER + "\n"
-                + f"name = {toml_str(label[:40].rstrip())}\n"
-                  'color = "blue"\n\n'
+                + f"name = {toml_str(label[:40].rstrip())}\n\n"
                   "[[panes]]\n"
                   'id = "main"\n'
                   'type = "terminal"\n'

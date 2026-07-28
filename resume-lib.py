@@ -397,7 +397,13 @@ def agent_running(term_id):
         ps = subprocess.run(["ps", "-Ao", "pid=,command="], capture_output=True, text=True).stdout
         for line in ps.splitlines():
             p = line.strip().split(None, 1)
-            if len(p) < 2 or not any(a in p[1].lower() for a in ("claude", "codex", "gemini")):
+            # The BINARY must be the agent — not any command whose path happens to contain
+            # "claude". Everything under ~/.claude/** matches a substring test, and so does
+            # this very process when the library lives under such a path: it then finds its
+            # OWN environment, reports "an agent is already running in this pane", and every
+            # restore is silently skipped. Caught 2026-07-28 by a test whose scratch
+            # directory happened to be /private/tmp/claude-501/.
+            if len(p) < 2 or os.path.basename(p[1].split(" ", 1)[0]) not in ("claude", "codex", "gemini"):
                 continue
             env = subprocess.run(["ps", "eww", "-o", "command=", "-p", p[0]], capture_output=True, text=True).stdout
             m = re.search(r"SUPERSET_TERMINAL_ID=([0-9a-f-]{36})", env)
