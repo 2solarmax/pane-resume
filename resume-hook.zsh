@@ -202,7 +202,12 @@ if [[ -o interactive ]] \
         export _SUPERSET_RESUME_DONE=1
         return 0
       fi
-      if [[ "$(command python3 "$lib" claim "$sid" "$bootid" 2>/dev/null)" != 1 ]]; then
+      # `== 0`, not `!= 1`. The library prints 0 ONLY when another pane already holds this
+      # conversation; every other outcome — including no output at all because python3 died
+      # or was starved during a 40-pane restore — must PROCEED. Testing for "not 1" turns
+      # every such failure into a refused restore, with the pane's one-shot lock already
+      # burned, which is the opposite of what this file promises everywhere else.
+      if [[ "$(command python3 "$lib" claim "$sid" "$bootid" 2>/dev/null)" == 0 ]]; then
         print -r -- "$(command date '+%F %T') STAND-DOWN term=$termid sid=$sid reason=another-pane-claimed-it" >> "$log" 2>/dev/null
         export _SUPERSET_RESUME_DONE=1
         return 0

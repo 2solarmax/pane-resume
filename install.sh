@@ -19,11 +19,16 @@ FILES=(resume-lib.py resume-hook.zsh superset-resume warp-session-hook.py
 # by every live shell on the machine — installing a file with a syntax error breaks every new
 # pane, including every pane of the next crash restore, which is exactly when you need it.
 for f in "${FILES[@]}"; do
-  case "$f" in
-    *.zsh) zsh -n "$SRC/$f" || { echo "REFUSING TO INSTALL: $f has a syntax error"; exit 1; } ;;
-    *)     python3 -c "import ast,sys;ast.parse(open(sys.argv[1]).read())" "$SRC/$f" \
-             || { echo "REFUSING TO INSTALL: $f has a syntax error"; exit 1; } ;;
-  esac
+  # Dispatch on the SHEBANG, not the extension. `superset-resume` is bash with no suffix,
+  # and handing it to a python parser made the gate reject every install — the guard meant to
+  # protect the install path was the thing that broke it.
+  head1="$(head -1 "$SRC/$f")"
+  case "$head1" in
+    *zsh)    zsh  -n "$SRC/$f" ;;
+    *bash|*/sh) bash -n "$SRC/$f" ;;
+    *python*) python3 -c "import ast,sys;ast.parse(open(sys.argv[1]).read())" "$SRC/$f" ;;
+    *)       case "$f" in *.zsh) zsh -n "$SRC/$f" ;; *) true ;; esac ;;
+  esac || { echo "REFUSING TO INSTALL: $f has a syntax error"; exit 1; }
 done
 
 # Copy to a temp name then rename. `mv` within one filesystem is atomic, so a shell starting

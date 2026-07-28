@@ -327,7 +327,10 @@ def conversation_live(sid):
         if len(head) < 2:
             continue
         cmd = head[1]
-        if "claude" not in cmd.split(" ", 1)[0]:
+        # The BINARY must be claude — not merely a path containing "claude".
+        # 67 processes on this machine live under ~/.claude/** (mcp-proxy, esbuild in a
+        # worktree); a substring test lets any of them refuse a restore.
+        if os.path.basename(cmd.split(" ", 1)[0]) != "claude":
             continue
         m = re.search(r"--resume\s+([0-9a-fA-F-]{36})", cmd)
         if m and m.group(1).lower() == want:
@@ -351,20 +354,36 @@ def claim_conversation(sid, epoch):
     to restore is worse than a duplicate risk we cannot even measure."""
     if not UUID_RE.match(sid or "") or not epoch:
         return True
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", epoch):
+        return True                            # never let an epoch escape its directory
     try:
         root = os.path.join(RECOV, "resuming")
         os.makedirs(root, exist_ok=True)
-        for name in os.listdir(root):          # reap other runs' claims
-            if name != epoch:
-                subprocess.run(["rm", "-rf", os.path.join(root, name)], timeout=10)
+        for name in os.listdir(root):          # reap runs that are over
+            if name == epoch:
+                continue
+            stale = os.path.join(root, name)
+            # rmdir, not rm -rf: it REFUSES a directory that still holds claims. A run whose
+            # panes are mid-restore keeps them — a pane can sit in the start-throttle for
+            # minutes with no agent visible yet, and its claim is the only thing standing
+            # between that conversation and a second writer.
+            try:
+                for c in os.listdir(stale):
+                    os.rmdir(os.path.join(stale, c))
+                os.rmdir(stale)
+            except OSError:
+                pass
         mine = os.path.join(root, epoch)
         os.makedirs(mine, exist_ok=True)
+    except Exception:
+        return True                            # fail OPEN
+    try:
         os.mkdir(os.path.join(mine, sid))      # bare mkdir — `-p` would always "succeed"
-        return True
     except FileExistsError:
         return False                           # another pane owns this conversation
     except Exception:
         return True                            # fail OPEN
+    return True
 
 
 def agent_running(term_id):
@@ -415,13 +434,29 @@ def warp_epoch():
     Empty string if Warp isn't found (caller then falls back to the boot id)."""
     try:
         out = subprocess.run(["ps", "-Ao", "pid=,lstart=,command="],
-                             capture_output=True, text=True).stdout
+                             capture_output=True, text=True, timeout=15).stdout
+        # Warp runs more than one process from that path — the app itself and a
+        # `terminal-server --parent-pid=<app>` child. Picking whichever `ps` listed first
+        # would give different panes different epochs, and panes in different epochs cannot
+        # see each other's claims: the exact split that lets two panes restore one
+        # conversation. Take the APP (no --parent-pid), lowest pid, so every pane agrees.
+        best = None
         for line in out.splitlines():
-            if "Warp.app/Contents/MacOS/" in line and "--type=" not in line:
-                parts = line.split(None, 1)
-                pid = parts[0]
-                started = parts[1].split("/Applications")[0].strip()
-                return "warp-%s-%s" % (pid, re.sub(r"[^0-9A-Za-z]", "", started))
+            if "Warp.app/Contents/MacOS/" not in line or "--type=" in line:
+                continue
+            if "--parent-pid=" in line:
+                continue                       # a child of the app, not the run itself
+            parts = line.split(None, 1)
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            started = parts[1].split("/Applications")[0].strip()
+            cand = (pid, "warp-%s-%s" % (pid, re.sub(r"[^0-9A-Za-z]", "", started)))
+            if best is None or cand[0] < best[0]:
+                best = cand
+        if best:
+            return best[1]
     except Exception:
         pass
     return ""
@@ -682,6 +717,11 @@ if __name__ == "__main__":
         print("1" if agent_running(sys.argv[2]) else "0")
     elif cmd == "conversation-live" and len(sys.argv) >= 3:
         print("1" if conversation_live(sys.argv[2]) else "0")
+    elif cmd == "guard" and len(sys.argv) >= 3:
+        # For the generated tab config's own command line. Exits non-zero ONLY when this
+        # conversation is provably running, so `guard && launch` refuses exactly one thing:
+        # a second copy writing into a live transcript. Any uncertainty exits 0 and launches.
+        sys.exit(1 if conversation_live(sys.argv[2]) else 0)
     elif cmd == "claim" and len(sys.argv) >= 4:
         print("1" if claim_conversation(sys.argv[2], sys.argv[3]) else "0")
     else:

@@ -206,8 +206,18 @@ def build_tab_configs(rows, launcher_for):
     Stems carry the conversation id, not a position: `restore_3` would mean a different
     conversation tomorrow, and these files are permanent one-click artifacts. Same
     conversation -> same file, rewritten rather than accumulating."""
+    # These files are permanent and one click away, forever. The liveness check that ran
+    # when they were written is worthless a day later — click one whose conversation you have
+    # since reopened and you get a SECOND writer on a live transcript, which is the exact
+    # corruption this whole change exists to prevent. So the guard travels IN the command:
+    # it exits non-zero only when that conversation is provably running, and `&&` then
+    # swallows the launch. This is the one place in the toolkit where `&&` refusing to launch
+    # is the feature rather than the bug.
+    lib = os.path.join(RECOV, "resume-lib.py")
+    guard = f"{shlex.quote(lib)} guard %s && " if os.access(lib, os.X_OK) else ""
     made = []
     for _m, sid, cwd, label in rows:
+        g = (guard % sid) if guard else ""
         stem = "restore_" + sid[:8]
         body = (MARKER + "\n"
                 + f"name = {toml_str(label[:40].rstrip())}\n"
@@ -216,7 +226,7 @@ def build_tab_configs(rows, launcher_for):
                   'id = "main"\n'
                   'type = "terminal"\n'
                 + f"directory = {toml_str(cwd)}\n"
-                + f"commands = [{toml_str(launcher_for(sid))}]\n")
+                + f"commands = [{toml_str(g + launcher_for(sid))}]\n")
         made.append((stem, body, sid, label, cwd))
     return made
 
@@ -253,7 +263,7 @@ def open_tabs(made, stagger=4.0):
     return 0
 
 
-def clean_tab_configs():
+def clean_tab_configs(dry=False):
     """Remove the tab configs this tool wrote — and ONLY those.
 
     They accumulate in a directory Warp enumerates, so after a big restore your own configs
@@ -272,10 +282,13 @@ def clean_tab_configs():
         try:
             if MARKER not in open(p, errors="ignore").readline():
                 continue          # not ours despite the name — leave it alone
-            os.remove(p); removed += 1
+            if not dry:
+                os.remove(p)
+            removed += 1
         except OSError:
             continue
-    print(f"\n  Removed {removed} tab config(s) this tool wrote. Yours are untouched.\n")
+    verb = "Would remove" if dry else "Removed"
+    print(f"\n  {verb} {removed} tab config(s) this tool wrote. Yours are untouched.\n")
     return 0
 
 
@@ -498,7 +511,7 @@ def main():
         i += 1
 
     if clean:
-        return clean_tab_configs()
+        return clean_tab_configs(dry)
 
     rows = collect(days, include_known)
     if rows is None:
