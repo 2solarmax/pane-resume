@@ -177,6 +177,108 @@ def collect(days, include_known):
     return rows
 
 
+TAB_DIR = os.path.join(HOME, ".warp", "tab_configs")
+
+
+def toml_str(s):
+    """A TOML basic string. `ensure_ascii=False` is load-bearing, not style: with the default,
+    an emoji becomes a surrogate pair, which TOML rejects outright — the whole file fails to
+    parse and that conversation silently never comes back. Titles are arbitrary user prose."""
+    return json.dumps(s, ensure_ascii=False)
+
+
+def build_tab_configs(rows, launcher_for):
+    """One Tab Config per conversation — the artifact Warp actually opens.
+
+    The tool used to write a Launch Configuration, which showed "No Results Found" in the
+    palette and opened nothing from either documented form of `warp://launch/<path>`. Tab
+    Configs open by name (`warp://tab_config/<stem>`), and are what the user already used.
+
+    Shape copied from the user's own configs, field for field. Two of those fields are
+    load-bearing rather than cosmetic:
+      * `type = "terminal"` — without it Warp may spawn its own billed agent harness.
+      * `directory` — the working directory as its OWN key. The obvious `cd <dir> && cmd`
+        instead is broken: zsh's two-argument `cd` fails on a path containing a space, `&&`
+        then swallows the launch, and the pane silently becomes a plain shell. That is not
+        hypothetical — it lost a session on 2026-07-27, and 11 of 115 candidate conversations
+        live under a path with a space in it.
+
+    Stems carry the conversation id, not a position: `restore_3` would mean a different
+    conversation tomorrow, and these files are permanent one-click artifacts. Same
+    conversation -> same file, rewritten rather than accumulating."""
+    made = []
+    for _m, sid, cwd, label in rows:
+        stem = "restore_" + sid[:8]
+        body = (MARKER + "\n"
+                + f"name = {toml_str(label[:40].rstrip())}\n"
+                  'color = "blue"\n\n'
+                  "[[panes]]\n"
+                  'id = "main"\n'
+                  'type = "terminal"\n'
+                + f"directory = {toml_str(cwd)}\n"
+                + f"commands = [{toml_str(launcher_for(sid))}]\n")
+        made.append((stem, body, sid, label, cwd))
+    return made
+
+
+def open_tabs(made, stagger=4.0):
+    """Open each generated tab, re-checking liveness immediately before EACH one.
+
+    The guard that ran before writing is minutes stale by the last open: 45 tabs at a few
+    seconds apart is several minutes, and you may have opened one of these yourself in the
+    meantime. `restore-in-place` already learned this — it re-runs its checks at the moment of
+    acting rather than trusting the plan. Same here.
+
+    The first opens in a NEW window so a restore lands somewhere of its own instead of
+    appending tabs to whatever you are working in; the rest join it."""
+    import subprocess
+    opened = skipped = 0
+    for i, (stem, _body, sid, label, _cwd) in enumerate(made):
+        busy = busy_sids()
+        if busy is None:
+            print(f"    skipped {label[:44]} — cannot tell what is open right now")
+            skipped += 1
+            continue
+        if sid in busy:
+            print(f"    skipped {label[:44]} — it became open while this was running")
+            skipped += 1
+            continue
+        uri = f"warp://tab_config/{stem}" + ("?new_window=true" if i == 0 else "")
+        subprocess.run(["open", uri], check=False)
+        print(f"    opening {label[:52]}")
+        opened += 1
+        time.sleep(stagger)
+    print(f"\n  {opened} opened" + (f", {skipped} skipped" if skipped else "") + ".")
+    print("  Give them a few seconds; each one starts an agent.\n")
+    return 0
+
+
+def clean_tab_configs():
+    """Remove the tab configs this tool wrote — and ONLY those.
+
+    They accumulate in a directory Warp enumerates, so after a big restore your own configs
+    are buried under dozens of ours. Identified by BOTH the filename shape and the marker, so
+    a file of yours that happens to be called restore_* is never touched."""
+    import re as _re
+    removed = 0
+    try:
+        names = os.listdir(TAB_DIR)
+    except OSError:
+        print("\n  Nothing to clean.\n"); return 0
+    for n in names:
+        if not _re.fullmatch(r"restore_[0-9a-f]{8}\.toml", n):
+            continue
+        p = os.path.join(TAB_DIR, n)
+        try:
+            if MARKER not in open(p, errors="ignore").readline():
+                continue          # not ours despite the name — leave it alone
+            os.remove(p); removed += 1
+        except OSError:
+            continue
+    print(f"\n  Removed {removed} tab config(s) this tool wrote. Yours are untouched.\n")
+    return 0
+
+
 def build(rows, per_tab, name, launcher):
     by_proj = {}
     for m, sid, cwd, label in rows:
@@ -362,6 +464,7 @@ def main():
     days, per_tab, name, dry, include_known = 1.0, 1, "restore-sessions", False, False
     limit, match, pick = 0, "", ""
     interactive = True
+    do_open = legacy = clean = False
     i = 0
     while i < len(a):
         if a[i] == "-d" and i + 1 < len(a):
@@ -382,11 +485,20 @@ def main():
             dry = True
         elif a[i] in ("--no-ui", "--all"):
             interactive = False          # take the whole window, no checkboxes
+        elif a[i] == "--open":
+            do_open = True
+        elif a[i] == "--clean":
+            clean = True
+        elif a[i] == "--launch-config":
+            legacy = True                # the old Warp Launch Configuration
         elif a[i] == "--all-known":
             include_known = True
         elif a[i] in ("-h", "--help"):
             print(__doc__); return 0
         i += 1
+
+    if clean:
+        return clean_tab_configs()
 
     rows = collect(days, include_known)
     if rows is None:
@@ -463,9 +575,6 @@ def main():
               f"across {(len(rows) + per_tab - 1) // per_tab} tab(s)\n")
     for _m, sid, cwd, label in rows:
         print(f"    {os.path.basename(cwd)[:24]:24}  {label}")
-    if dry:
-        print("\n--- config (not written) ---\n"); print(yaml); return 0
-
     # Last look before writing something you can run with one keystroke. Checked again here,
     # not just during collection, because a conversation can be opened while you read the list.
     busy = busy_sids()
@@ -481,6 +590,34 @@ def main():
             print(f"     {sid}")
         print()
         return 1
+
+    # ── Tab Configs: the artifact Warp actually opens ────────────────────────────────
+    if not legacy:
+        made = build_tab_configs(rows, lambda s: launcher % s)
+        if dry:
+            print("\n--- would write (not written) ---\n")
+            for stem, body, _s, _l, _c in made[:2]:
+                print(f"# ~/.warp/tab_configs/{stem}.toml"); print(body)
+            if len(made) > 2:
+                print(f"# … and {len(made) - 2} more, one per conversation")
+            return 0
+        os.makedirs(TAB_DIR, exist_ok=True)
+        for stem, body, _s, _l, _c in made:
+            p = os.path.join(TAB_DIR, stem + ".toml")
+            tmp = p + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.write(body)
+            os.replace(tmp, p)          # atomic: Warp never reads a half-written config
+        print(f"\n  Wrote {len(made)} tab config(s) to ~/.warp/tab_configs/")
+        if do_open:
+            return open_tabs(made)
+        print("\n  Open one:  Warp ⌘P → \"Tab Config\" → pick it by name")
+        print("  Or open them all now:  restore-plan --open")
+        print("  Remove them when done: restore-plan --clean\n")
+        return 0
+
+    if dry:
+        print("\n--- config (not written) ---\n"); print(yaml); return 0
 
     os.makedirs(LAUNCH_DIR, exist_ok=True)
     path = os.path.join(LAUNCH_DIR, f"{name}.yaml")

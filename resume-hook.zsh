@@ -186,6 +186,29 @@ if [[ -o interactive ]] \
     fi
     command mkdir "$lockdir" 2>/dev/null || return 0   # atomic one-shot
     print -r -- "$$" > "$lockdir/pid" 2>/dev/null      # owner PID -> stale-lock reclaim above
+
+    # ── ONE PANE PER CONVERSATION ────────────────────────────────────────────────────
+    # The pane lock above stops this PANE resuming twice. It cannot stop two DIFFERENT panes
+    # resuming the SAME conversation — and they do: a conversation lives in several panes over
+    # its life, every one keeps a durable record, and after a crash they all fire at once.
+    # 2026-07-27: two panes resumed one conversation in the same second; its transcript took
+    # 571 forked parent chains before anyone noticed. Two writers, one file.
+    #
+    # Order matters: pane lock FIRST, then the conversation claim. Reversed, a pane that loses
+    # the pane-lock race would leak a conversation claim and block the pane that should win.
+    if [[ -n "$sid" ]]; then
+      if [[ "$(command python3 "$lib" conversation-live "$sid" 2>/dev/null)" == 1 ]]; then
+        print -r -- "$(command date '+%F %T') STAND-DOWN term=$termid sid=$sid reason=already-running-elsewhere" >> "$log" 2>/dev/null
+        export _SUPERSET_RESUME_DONE=1
+        return 0
+      fi
+      if [[ "$(command python3 "$lib" claim "$sid" "$bootid" 2>/dev/null)" != 1 ]]; then
+        print -r -- "$(command date '+%F %T') STAND-DOWN term=$termid sid=$sid reason=another-pane-claimed-it" >> "$log" 2>/dev/null
+        export _SUPERSET_RESUME_DONE=1
+        return 0
+      fi
+    fi
+
     export _SUPERSET_RESUME_DONE=1
     print -r -- "$(command date '+%F %T') FIRED term=$termid $( (( is_warp )) && print -n warp || print -n "ws=$wsid" ) agent=$agent sid=$sid" >> "$log" 2>/dev/null
 

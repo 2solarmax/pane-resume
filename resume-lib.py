@@ -18,8 +18,14 @@ Commands:
 """
 import sys, os, glob, sqlite3, subprocess, re, time, json
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import titlelib            # what to CALL a conversation — one rule, every surface
+# What to CALL a conversation — one rule, every surface. Imported DEFENSIVELY: the resume
+# hook calls this file for every pane, so a missing titlelib must cost a pane's title, never
+# every pane's restore.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import titlelib
+except Exception:
+    titlelib = None
 
 HOME = os.path.expanduser("~")
 RECOV = os.path.join(HOME, ".superset-recovery")
@@ -206,6 +212,8 @@ def _label(sid):
     m = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", f"{sid}.jsonl"))
     if not m:
         return ""
+    if titlelib is None:
+        return ""          # no naming rule available — a pane loses its title, nothing else
     return titlelib.name_of(m[0], 60)
 
 
@@ -287,6 +295,77 @@ def native_resume_present():
         return any(_NATIVE_COL_HINT.search(c) for c in extra)
     except Exception:
         return False
+
+def conversation_live(sid):
+    """Is THIS CONVERSATION already running anywhere — in any pane, any terminal?
+
+    The dedup that existed before this asked "is an agent running in this PANE", which is a
+    different question and cannot see the failure that matters: a conversation lives in
+    several panes over its life (resumed, reopened, dragged), every pane keeps a durable
+    record of it, and after a crash they ALL resume it. On 2026-07-27 two panes resumed one
+    conversation in the same second and its transcript took 571 forked parent chains — two
+    writers interleaving into one file.
+
+    Deliberately EXACT: it matches a live `--resume <sid>` on a real agent process and
+    nothing else. It does NOT use the 15-minute "recently written transcript" inference that
+    `restore-plan` uses, because a false positive there costs a keystroke while a false
+    positive HERE costs the restore — the pane's one-shot lock is already burned by then, so
+    the conversation would not come back at all for the rest of that boot.
+
+    Reads only how each process was started, and extracts only the conversation id — never
+    anything else from the process table, which on this machine can carry secrets."""
+    if not UUID_RE.match(sid or ""):
+        return False
+    try:
+        ps = subprocess.run(["ps", "-Ao", "pid=,command="],
+                            capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return False          # cannot tell -> do NOT block a restore
+    want = sid.lower()
+    for line in ps.splitlines():
+        head = line.strip().split(" ", 1)
+        if len(head) < 2:
+            continue
+        cmd = head[1]
+        if "claude" not in cmd.split(" ", 1)[0]:
+            continue
+        m = re.search(r"--resume\s+([0-9a-fA-F-]{36})", cmd)
+        if m and m.group(1).lower() == want:
+            return True
+    return False
+
+
+def claim_conversation(sid, epoch):
+    """Reserve this conversation for THIS pane, so no other pane restores it too.
+
+    `mkdir` IS the claim: it is atomic, so of N panes racing for one conversation exactly one
+    wins. No lock file to corrupt, no pid to go stale, no releaser to spawn.
+
+    Namespaced by the terminal run (`epoch`), and other runs' claims are reaped on the way
+    in — the same shape as the one-shot pane lock. That is what makes expiry unnecessary:
+    the dangerous case is a crash at T and a relaunch at T+3min, where a time-expiring claim
+    from the dead run would refuse the very restore it exists to enable. A claim from a
+    previous run is meaningless by construction, so it is removed rather than waited out.
+
+    Returns True when this pane may proceed. Any error returns True — a restore that refuses
+    to restore is worse than a duplicate risk we cannot even measure."""
+    if not UUID_RE.match(sid or "") or not epoch:
+        return True
+    try:
+        root = os.path.join(RECOV, "resuming")
+        os.makedirs(root, exist_ok=True)
+        for name in os.listdir(root):          # reap other runs' claims
+            if name != epoch:
+                subprocess.run(["rm", "-rf", os.path.join(root, name)], timeout=10)
+        mine = os.path.join(root, epoch)
+        os.makedirs(mine, exist_ok=True)
+        os.mkdir(os.path.join(mine, sid))      # bare mkdir — `-p` would always "succeed"
+        return True
+    except FileExistsError:
+        return False                           # another pane owns this conversation
+    except Exception:
+        return True                            # fail OPEN
+
 
 def agent_running(term_id):
     """True if an agent process is already bound to this pane (native/manual already
@@ -601,5 +680,9 @@ if __name__ == "__main__":
         print("1" if native_resume_present() else "0")
     elif cmd == "agent-running" and len(sys.argv) >= 3:
         print("1" if agent_running(sys.argv[2]) else "0")
+    elif cmd == "conversation-live" and len(sys.argv) >= 3:
+        print("1" if conversation_live(sys.argv[2]) else "0")
+    elif cmd == "claim" and len(sys.argv) >= 4:
+        print("1" if claim_conversation(sys.argv[2], sys.argv[3]) else "0")
     else:
         print(__doc__)

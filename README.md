@@ -2,6 +2,8 @@
 
 Auto-resume your terminal's agent conversations after a **full Mac restart**. Supports **[Warp](https://warp.dev)** and **[Superset](https://superset.sh)**.
 
+> **One pane per conversation.** A conversation lives in several panes over its life — resumed, reopened, moved. Every pane keeps a durable record of it, so after a crash they would *all* restore it, and two copies appending to one transcript interleave it into nonsense. Before launching, a pane atomically claims the conversation (`resuming/<run>/<sid>`) and checks no agent is already running it; whoever claims first restores it and the rest stand down and say so in the log. Claims are namespaced per terminal run and the previous run's are reaped on the way in — a claim from the run that just crashed must never refuse the restore it exists to enable.
+
 Both terminals restore your windows/tabs/panes and their working directory when you relaunch — but after a *machine restart* they bring each pane back as an **idle shell**, with the Claude Code / Codex / Gemini conversation that was running in it gone. This tool bridges that gap: when a pane comes back, it resumes the exact session it had.
 
 ## Why a restart loses sessions (and closing the app doesn't)

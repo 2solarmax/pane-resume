@@ -12,9 +12,25 @@ END="# <<< superset-recovery <<<"
 
 echo "Installing pane-resume → $DEST"
 mkdir -p "$DEST"
-cp "$SRC/resume-lib.py" "$SRC/resume-hook.zsh" "$SRC/superset-resume" \
-   "$SRC/warp-session-hook.py" "$SRC/pane-title.py" "$SRC/titlelib.py" \
-   "$SRC/restore-plan" "$SRC/restore-in-place" "$SRC/sess" "$DEST/"
+FILES=(resume-lib.py resume-hook.zsh superset-resume warp-session-hook.py
+       pane-title.py titlelib.py restore-plan restore-in-place sess)
+
+# Check EVERY file parses before copying ANY of them. This directory is sourced and imported
+# by every live shell on the machine — installing a file with a syntax error breaks every new
+# pane, including every pane of the next crash restore, which is exactly when you need it.
+for f in "${FILES[@]}"; do
+  case "$f" in
+    *.zsh) zsh -n "$SRC/$f" || { echo "REFUSING TO INSTALL: $f has a syntax error"; exit 1; } ;;
+    *)     python3 -c "import ast,sys;ast.parse(open(sys.argv[1]).read())" "$SRC/$f" \
+             || { echo "REFUSING TO INSTALL: $f has a syntax error"; exit 1; } ;;
+  esac
+done
+
+# Copy to a temp name then rename. `mv` within one filesystem is atomic, so a shell starting
+# mid-install reads either the old file or the new one — never half of either.
+for f in "${FILES[@]}"; do
+  cp "$SRC/$f" "$DEST/.$f.tmp" && mv -f "$DEST/.$f.tmp" "$DEST/$f"
+done
 # titlelib is imported by the others, not run, so it stays non-executable on purpose.
 chmod +x "$DEST/superset-resume" "$DEST/resume-lib.py" "$DEST/warp-session-hook.py" \
          "$DEST/pane-title.py" "$DEST/restore-plan" "$DEST/restore-in-place" "$DEST/sess"
