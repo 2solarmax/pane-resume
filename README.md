@@ -81,9 +81,6 @@ both are handled for you:
   (`warp_set_title_idle_on_precmd`), so a title set once at shell start is gone before you see
   it. The hook sets `WARP_DISABLE_AUTO_TITLE=true` and re-asserts the label from its own
   `precmd`, so the label is what you actually see.
-- To see all of them at once, set **`display_granularity = "panes"`** under
-  `[appearance.vertical_tabs]` in `~/.warp/settings.toml`. The default (`"tabs"`) gives one
-  sidebar row per tab showing only the focused pane, so most panes have no row at all.
 
 ### Recovering after a restart you weren't armed for
 

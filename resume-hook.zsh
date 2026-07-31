@@ -38,7 +38,13 @@ if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \
     emulate -L zsh
     local lbl
     lbl="$(command python3 "$HOME/.superset-recovery/resume-lib.py" pane-label "$WARP_TERMINAL_SESSION_UUID" 2>/dev/null)"
-    [[ -n "$lbl" ]] || return 0
+    # NO early return on an empty label. A brand-new tab has no record YET — the record is
+    # written when a session STARTS in it, which is after this shell. Bailing here meant the
+    # title hook was never registered for exactly those panes, so when you later quit that
+    # session Warp reset the pane to its folder and it stayed nameless for the life of the
+    # shell. That is the nameless pane in the sidebar, and it regenerated on every new tab.
+    # Register unconditionally; the hook below decides each prompt whether it has anything
+    # to say, and picks the label up the moment the record appears.
     # Printing this once is not enough, and that is why you could see the label in Superset
     # but never in Warp. Warp's own shell bootstrap registers `warp_set_title_idle_on_precmd`,
     # which sets the title to the working directory at EVERY prompt
@@ -62,7 +68,11 @@ if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \
     # covers the preexec hook, which owns the title for the whole duration of a command, and
     # it does not depend on Warp's bootstrap registration order, which is internal and can
     # change in any release. The precmd below stays as the belt-and-braces guarantee.
-    export WARP_DISABLE_AUTO_TITLE=true
+    #
+    # Set ONLY once we actually have a name. A pane we cannot name must keep Warp's own
+    # folder title — silencing Warp for a pane we have nothing to say about would leave it
+    # blank, which is worse than the folder.
+    [[ -n "$_PANE_RESUME_TITLE" ]] && export WARP_DISABLE_AUTO_TITLE=true
 
     _pane_resume_set_title() {
       # A label captured at shell start and re-asserted forever goes confidently WRONG: reopen
@@ -76,7 +86,11 @@ if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \
         _PANE_RESUME_TITLE="$(command python3 "$HOME/.superset-recovery/resume-lib.py" \
           pane-label "$WARP_TERMINAL_SESSION_UUID" 2>/dev/null)"
         _PANE_RESUME_TITLE="${_PANE_RESUME_TITLE[1,60]}"
+        # The record just appeared (a session started in this pane) — from here on we own
+        # the title, so stop Warp resetting it to the folder when that session ends.
+        [[ -n "$_PANE_RESUME_TITLE" ]] && export WARP_DISABLE_AUTO_TITLE=true
       fi
+      # Nothing to say yet: leave Warp's folder title alone rather than blanking the pane.
       [[ -n "$_PANE_RESUME_TITLE" ]] || return 0
       # `print -r --`, NOT `print -P`: a conversation is named by the user's own prose, and a
       # title containing "100%" or "%~" would otherwise be expanded as prompt escapes.
@@ -264,11 +278,19 @@ if [[ -o interactive ]] \
     export _SUPERSET_RESUME_DONE=1
     print -r -- "$(command date '+%F %T') FIRED term=$termid $( (( is_warp )) && print -n warp || print -n "ws=$wsid" ) agent=$agent sid=$sid" >> "$log" 2>/dev/null
 
-    # 3) Announce and resume IMMEDIATELY — no stagger. The deliberate delay proved worse
-    #    than the thundering herd it guarded against (2026-07-14: panes frozen for minutes
-    #    waiting on their slot); a full-workspace batch of concurrent resumes is fine on
-    #    modern hardware, and dozens of live agents run side-by-side anyway.
-    print -Pn "%F{cyan}▶ superset-recovery: resuming ${agent} %f"; print -r -- "${sid[1,8]}…"
+    # 3) Resume IMMEDIATELY — no stagger. The deliberate delay proved worse than the
+    #    thundering herd it guarded against (2026-07-14: panes frozen for minutes waiting on
+    #    their slot); a full-workspace batch of concurrent resumes is fine on modern hardware,
+    #    and dozens of live agents run side-by-side anyway.
+    #
+    #    There is deliberately NO "resuming …" banner here. It printed before the launch was
+    #    even assembled, so a launch that never happened — Ctrl-C during the throttle wait, a
+    #    missing launcher, an agent that exits at once — left the pane asserting it had
+    #    resumed. Redundant when it was right (the command itself is typed onto the prompt a
+    #    few lines below, and the shell's own error is a truer report), and false in exactly
+    #    the case where it was the only thing on screen. It also named the conversation by
+    #    eight hex characters, which is the useless-id form this tool exists to replace.
+    #    What a pane holds is answered by its TITLE, which is a fact and survives.
 
     # 4) Rebuild the launcher. Superset supplies the user's preset command+args (parts[3..],
     #    e.g. a `cc all …` wrapper). Warp doesn't record the launcher, so prefer the user's
