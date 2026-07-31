@@ -714,7 +714,11 @@ if __name__ == "__main__":
                 # exists. The folder plus a short id is at least unique per pane.
                 short = os.path.basename(cwd.rstrip("/")) or cwd
                 if short or sid:
+                    # Cleaned like every other label path. This one goes into a terminal
+                    # escape once per PROMPT now, so a control byte in a directory name would
+                    # break out of the OSC on every redraw rather than once per shell.
                     out = f"{short} · {sid[:8]}".strip(" ·")
+                    out = titlelib.clean(out) if titlelib else out
                     break
         print(out)
     elif cmd == "native":

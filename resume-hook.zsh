@@ -49,8 +49,36 @@ if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \
     # it does: the bootstrap registers before rcfiles, so ours is appended after and runs last.
     # Re-asserting costs one `print` per prompt — no subprocess, nothing recomputed.
     _PANE_RESUME_TITLE="${lbl[1,60]}"
+    _PANE_RESUME_BINDING="$HOME/.superset-recovery/warp-last/$WARP_TERMINAL_SESSION_UUID"
+    zmodload -F zsh/stat b:zstat 2>/dev/null
+    _pane_resume_stamp() {
+      local -a s
+      zstat -A s +mtime "$_PANE_RESUME_BINDING" 2>/dev/null && print -r -- "$s[1]"
+    }
+    _PANE_RESUME_STAMP="$(_pane_resume_stamp)"
+
+    # Warp ships the switch for this: both of its title hooks return early when
+    # WARP_DISABLE_AUTO_TITLE is true. Using it is better than out-ordering them — it also
+    # covers the preexec hook, which owns the title for the whole duration of a command, and
+    # it does not depend on Warp's bootstrap registration order, which is internal and can
+    # change in any release. The precmd below stays as the belt-and-braces guarantee.
+    export WARP_DISABLE_AUTO_TITLE=true
+
     _pane_resume_set_title() {
-      # `print -r --` NOT `print -P`: a conversation is named by the user's own prose, and a
+      # A label captured at shell start and re-asserted forever goes confidently WRONG: reopen
+      # a different conversation in this pane and the header would keep naming the old one,
+      # which is worse than showing nothing for a tool whose whole job is telling you what a
+      # pane holds. So re-read only when the pane's binding actually changed. `zstat` is a
+      # builtin — this costs no fork per prompt.
+      local now="$(_pane_resume_stamp)"
+      if [[ -n "$now" && "$now" != "$_PANE_RESUME_STAMP" ]]; then
+        _PANE_RESUME_STAMP="$now"
+        _PANE_RESUME_TITLE="$(command python3 "$HOME/.superset-recovery/resume-lib.py" \
+          pane-label "$WARP_TERMINAL_SESSION_UUID" 2>/dev/null)"
+        _PANE_RESUME_TITLE="${_PANE_RESUME_TITLE[1,60]}"
+      fi
+      [[ -n "$_PANE_RESUME_TITLE" ]] || return 0
+      # `print -r --`, NOT `print -P`: a conversation is named by the user's own prose, and a
       # title containing "100%" or "%~" would otherwise be expanded as prompt escapes.
       print -rn -- $'\033]0;'"$_PANE_RESUME_TITLE"$'\007'
     }

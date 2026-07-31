@@ -72,6 +72,19 @@ superset-resume bootstrap   # (Warp) seed bindings for sessions already running
 
 Arm it and leave it armed, so it's already on **before** your next restart. Panes resume as the terminal loads them.
 
+### Seeing what a pane held, without restoring anything
+
+Each pane titles itself with the conversation it holds. Two Warp details make this work, and
+both are handled for you:
+
+- Warp's own shell integration resets the title to the working directory at **every prompt**
+  (`warp_set_title_idle_on_precmd`), so a title set once at shell start is gone before you see
+  it. The hook sets `WARP_DISABLE_AUTO_TITLE=true` and re-asserts the label from its own
+  `precmd`, so the label is what you actually see.
+- To see all of them at once, set **`display_granularity = "panes"`** under
+  `[appearance.vertical_tabs]` in `~/.warp/settings.toml`. The default (`"tabs"`) gives one
+  sidebar row per tab showing only the focused pane, so most panes have no row at all.
+
 ### Recovering after a restart you weren't armed for
 
 Arming only helps the *next* restart. If the terminal has already come back with a screen full

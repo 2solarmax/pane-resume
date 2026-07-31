@@ -163,6 +163,12 @@ def resume(rows, n, print_only=False):
     if print_only:
         print(cmd); return 0
     print(f"\n  Reopening: {lb}\n  → {cmd}\n")
+    # Same reason as the probe above, and the half that actually bites: this shell is
+    # interactive, lives in the pane, and would otherwise re-register the pane as ITS pid.
+    # When you quit the conversation this shell exits, and the pane is left pointing at a
+    # dead process — so the next restore skips it. The pane's own long-lived shell is still
+    # underneath and already correctly registered; it must stay the registered one.
+    os.environ["_SUPERSET_RESUME_DONE"] = "1"
     os.execvp("zsh", ["zsh", "-ic", cmd])
 
 
