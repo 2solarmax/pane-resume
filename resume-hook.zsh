@@ -38,7 +38,26 @@ if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \
     emulate -L zsh
     local lbl
     lbl="$(command python3 "$HOME/.superset-recovery/resume-lib.py" pane-label "$WARP_TERMINAL_SESSION_UUID" 2>/dev/null)"
-    [[ -n "$lbl" ]] && print -n -- $'\033]0;'"${lbl[1,60]}"$'\007'
+    [[ -n "$lbl" ]] || return 0
+    # Printing this once is not enough, and that is why you could see the label in Superset
+    # but never in Warp. Warp's own shell bootstrap registers `warp_set_title_idle_on_precmd`,
+    # which sets the title to the working directory at EVERY prompt
+    # (zsh_body.sh:1148, ZSH_THEME_TERM_TITLE_IDLE="%~" — present in the shipped binary).
+    # So our title was overwritten before the first prompt was ever drawn, on every pane.
+    #
+    # Warp's own comment says a user's title hook registered from .zshrc is meant to win, and
+    # it does: the bootstrap registers before rcfiles, so ours is appended after and runs last.
+    # Re-asserting costs one `print` per prompt — no subprocess, nothing recomputed.
+    _PANE_RESUME_TITLE="${lbl[1,60]}"
+    _pane_resume_set_title() {
+      # `print -r --` NOT `print -P`: a conversation is named by the user's own prose, and a
+      # title containing "100%" or "%~" would otherwise be expanded as prompt escapes.
+      print -rn -- $'\033]0;'"$_PANE_RESUME_TITLE"$'\007'
+    }
+    typeset -ga precmd_functions
+    (( ${precmd_functions[(I)_pane_resume_set_title]} )) \
+      || precmd_functions+=(_pane_resume_set_title)
+    _pane_resume_set_title
   }
 fi
 

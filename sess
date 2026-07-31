@@ -147,10 +147,18 @@ def resume(rows, n, print_only=False):
     # Prefer the user's own wrapper so their env/router is set up the same as always.
     # `whence -w cc` alone is NOT enough: every Mac with Xcode has /usr/bin/cc (the C
     # compiler), so a bare existence test passes and we would hand the resume to a compiler.
+    # _SUPERSET_RESUME_DONE is NOT optional here. This probe sources the user's .zshrc, which
+    # sources the resume hook, which registers the pane's own shell in warp-shell/. Without the
+    # flag this transient subshell overwrites that record with ITS pid and then exits — leaving
+    # the pane registered to a dead process, so restore-in-place later skips it as "no live
+    # shell registered". That is the 2026-07-27 defect the hook's own comment documents; the
+    # other two probes set it and this one did not, so every `sess <N>` quietly broke the
+    # restorability of the pane it was run from.
     has_cc = subprocess.run(
         ["zsh", "-ic", "w=$(whence -w cc 2>/dev/null); "
                        "[[ \"$w\" == *': function' || \"$w\" == *': alias' ]]"],
-        capture_output=True).returncode == 0
+        capture_output=True,
+        env={**os.environ, "_SUPERSET_RESUME_DONE": "1"}).returncode == 0
     cmd = f"cc all --resume {sid}" if has_cc else f"claude --resume {sid}"
     if print_only:
         print(cmd); return 0
