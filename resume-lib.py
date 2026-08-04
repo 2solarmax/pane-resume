@@ -121,6 +121,78 @@ def _norm_agent(agent_id):
     return ""   # only auto-resume agents with a known non-interactive resume
 
 
+# Directories that are throwaway by construction. A conversation started in one was an agent
+# scratchpad, not a project: the directory is keyed to another session and is deleted when that
+# session ends, so auto-resuming into it gives you a live agent whose cwd can vanish underneath
+# it — every command then fails with "No such file or directory", which reads as a broken agent
+# rather than a reaped folder. `restore-plan` already refuses these; the auto-resume path
+# inherits the same policy from here rather than diverging from it.
+TEMP_ROOTS = ("/var/folders", "/private/var/folders", "/tmp", "/private/tmp")
+
+
+def _is_temp(path):
+    """True for a throwaway directory. Matches the root ITSELF as well as anything under it —
+    a bare "/private/tmp" does not start with "/private/tmp/", and two real bindings sit at
+    exactly that path."""
+    rp = os.path.realpath(path or "")
+    return any(rp == t or rp.startswith(t + os.sep) for t in TEMP_ROOTS)
+
+
+def _project_dirs(path):
+    """Every name Claude Code might file this directory's conversations under.
+
+    Claude encodes the directory AS THE SHELL SEES IT, so a path and its resolved form are
+    two different folder names — on macOS /tmp and /private/tmp are the same directory but
+    encode differently. Comparing only one of them reports "this conversation belongs
+    somewhere else" for a pane that is standing in exactly the right place."""
+    out = []
+    for p in (path or "", os.path.realpath(path or "")):
+        if not p:
+            continue
+        enc = "".join(ch if ch.isalnum() else "-" for ch in p)
+        if enc not in out:
+            out.append(enc)
+    return out
+
+
+def launch_plan(sid, pwd):
+    """Can `--resume <sid>` actually FIND this conversation from where we are about to run it?
+
+    This is the question that decides whether a restore works, and nothing used to ask it.
+    `claude --resume` resolves a session against the project folder for the CURRENT directory,
+    while our existence check asked only whether a transcript existed ANYWHERE. A pane restored
+    into a different folder than the conversation belongs to therefore passed every check and
+    then died with "No conversation found with session ID" — a live-looking pane holding
+    nothing. 2026-08-03: 2 of 57 restores failed exactly this way.
+
+    Returns one of:
+      HERE            resume right here (60 of 61 panes — the ordinary case, no risk added)
+      CD\t<dir>       resume from <dir>, which is verified to resolve this conversation
+      NO\t<reason>    do not resume, and tell the user why in their own words
+    """
+    tr = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", sid + ".jsonl"))
+    if not tr:
+        return "NO\tits transcript is no longer on disk"
+    projdir = os.path.basename(os.path.dirname(tr[0]))
+    if projdir in _project_dirs(pwd):
+        return "HERE"
+    target = ""
+    if titlelib is not None:
+        try:
+            target = titlelib.read_transcript(tr[0]).cwd or ""
+        except Exception:
+            target = ""
+    if not target:
+        return "NO\tit belongs to another folder and that folder is not recorded"
+    if not os.path.isdir(target):
+        return "NO\tit lived in %s, which no longer exists" % target
+    if _is_temp(target):
+        return "NO\tit lived in a temporary folder (%s) — reopen it deliberately with `sess`" % target
+    if projdir not in _project_dirs(target):
+        return "NO\tits folder moved; resume cannot find it from %s" % target
+    return "CD\t" + target
+
+
 def _transcript_exists(agent, cwd, sid):
     """For claude, confirm the conversation transcript is still on disk — else
     `claude --resume` would silently start a FRESH session (defeating the point)."""
@@ -542,17 +614,16 @@ def resolve_warp(uuid):
     if not _transcript_exists("claude", cwd, sid):
         _wlog("transcript gone for %s (pane %s) — no resume" % (sid[:8], uuid[:8]))
         return ""
-    # defense-in-depth (NON-blocking on absence): if Warp still lists this pane its cwd
-    # must match the binding's -> a genuine mismatch skips (fail-closed). Absent/unreadable
-    # (Warp may not have rewritten the row yet the instant the restored shell spawns) ->
-    # TRUST the self-recorded binding and proceed. realpath so a symlinked path
-    # (/tmp -> /private/tmp) isn't a false mismatch.
-    live_cwd = _warp_pane_cwd(uuid)
-    if live_cwd is None:
-        _wlog("pane %s not yet in warp.sqlite — trusting binding (proceed)" % uuid[:8])
-    elif os.path.realpath(live_cwd) != os.path.realpath(cwd):
-        _wlog("cwd mismatch pane %s (warp=%s binding=%s) — no resume" % (uuid[:8], live_cwd, cwd))
-        return ""
+    # The directory question is NOT answered here any more. It used to compare the binding's
+    # cwd against Warp's own record of the pane, and that comparison was a race it lost:
+    # during a cold restore Warp has usually not written the row yet, so it logged "not yet in
+    # warp.sqlite — trusting binding (proceed)" and proceeded regardless. Measured over the
+    # log: 81 bypasses vs 8 enforcements — the guard was inert in exactly the scenario it
+    # existed for, and it ALSO refused a pane (a29a526c) whose restored directory was correct.
+    #
+    # `launch_plan()` asks the only question that decides the outcome — can `--resume` resolve
+    # this conversation from the directory we are about to launch in — using the transcript's
+    # own location rather than a foreign database. The caller consults it at launch time.
     return "\t".join(["claude", sid])
 
 
@@ -727,6 +798,8 @@ if __name__ == "__main__":
         print("1" if agent_running(sys.argv[2]) else "0")
     elif cmd == "conversation-live" and len(sys.argv) >= 3:
         print("1" if conversation_live(sys.argv[2]) else "0")
+    elif cmd == "launch-plan" and len(sys.argv) >= 4:
+        print(launch_plan(sys.argv[2], sys.argv[3]))
     elif cmd == "guard" and len(sys.argv) >= 3:
         # For the generated tab config's own command line. Exits non-zero ONLY when this
         # conversation is provably running, so `guard && launch` refuses exactly one thing:

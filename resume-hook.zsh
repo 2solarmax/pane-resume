@@ -322,6 +322,36 @@ if [[ -o interactive ]] \
       print -r -- "$(command date '+%F %T')   -> $agent not found; left as shell" >> "$log" 2>/dev/null
       return 0
     fi
+    # ── CAN `--resume` ACTUALLY FIND IT FROM HERE? ───────────────────────────────────
+    # `claude --resume <id>` looks the conversation up under the project folder for the
+    # CURRENT directory, not globally. Every check before this one only proved a transcript
+    # existed SOMEWHERE — so a pane restored into a different folder than its conversation
+    # belongs to passed everything and then died with "No conversation found with session
+    # ID", leaving a pane that looks restored and holds nothing (2 of 57 on 2026-08-03).
+    local -a _plan_parts
+    local _plan="$(command python3 "$lib" launch-plan "$sid" "$PWD" 2>/dev/null)"
+    _plan_parts=( ${(s.	.)_plan} )
+    case "$_plan_parts[1]" in
+      NO)
+        # Say so IN the pane. This is a fact about what was here, not a promise about a
+        # launch — the pane's title already names the conversation, and a pane that explains
+        # itself beats one showing a raw session id it cannot act on.
+        print -r -- ""
+        print -Pn "%F{yellow}▸ not resumed:%f "
+        print -r -- "${_plan_parts[2]:-reason unavailable}"
+        print -r -- "$(command date '+%F %T')   -> NOT RESUMED sid=$sid reason=${_plan_parts[2]}" >> "$log" 2>/dev/null
+        return 0
+        ;;
+      CD)
+        # Only reached when that directory is verified to resolve this conversation. A
+        # SUBSHELL, so a failed cd cannot swallow the launch (`cd x && cmd` losing a session
+        # is a mistake this repo has already made) and the pane keeps its own directory.
+        if [[ -n "$_plan_parts[2]" && -d "$_plan_parts[2]" ]]; then
+          base=( "(" cd -- "${(q)_plan_parts[2]}" "&&" "${(@)base}" ")" )
+          print -r -- "$(command date '+%F %T')   -> launching from ${_plan_parts[2]}" >> "$log" 2>/dev/null
+        fi
+        ;;
+    esac
     command : > "$lockdir/exec" 2>/dev/null   # mark: reached launch -> one-shot honored, NOT reclaimable
     # Drain tty type-ahead before handing the pane to the agent. A terminal may re-send the
     # pane's preset command text on restore; while zshrc runs it sits unread in the tty buffer
