@@ -385,6 +385,8 @@ if [[ -o interactive ]] \
     local _wait=""
     [[ -x "$recov/superset-resume" ]] && _wait="${(q)recov}/superset-resume wait-slot && "
     typeset -g _SUPERSET_RESUME_CMD="${_wait}${(j: :)${(q)base[@]}}"
+    # A copy the widget compares against, so a corrupted line is caught with its bytes.
+    typeset -g _SUPERSET_RESUME_EXPECT="$_SUPERSET_RESUME_CMD"
     _superset_resume_kick() {
       emulate -L zsh
       # one-shot: never fire again in this shell, even if the launch fails
@@ -396,6 +398,20 @@ if [[ -o interactive ]] \
       [[ -n "$_SUPERSET_RESUME_CMD" ]] || return 0
       BUFFER="$_SUPERSET_RESUME_CMD"
       unset _SUPERSET_RESUME_CMD
+      # Record what is ACTUALLY about to be submitted, not what we intended. Panes have been
+      # seen carrying escape fragments (`^[i`) on the resume line, which makes the whole line
+      # a bogus command and leaves the pane dead for the run — but every measurement so far
+      # says the line is clean at THIS point (196 of 196 accepted commands in history, 62 of
+      # 62 on the last restore storm, 20 of 20 under deliberate injection). So the garbage
+      # arrives somewhere after here, most likely while `wait-slot` holds the tty in echo
+      # mode for minutes. Rather than guess again, capture the bytes: if BUFFER ever differs
+      # from the command we built, the next occurrence arrives with evidence instead of a
+      # recollection. Costs one comparison and writes nothing in the normal case.
+      if [[ "$BUFFER" != "$_SUPERSET_RESUME_EXPECT" ]]; then
+        print -r -- "$(command date '+%F %T')   -> BUFFER DIFFERS at submit: ${(qqq)BUFFER}" \
+          >> "$HOME/.superset-recovery/resume.log" 2>/dev/null
+      fi
+      unset _SUPERSET_RESUME_EXPECT
       zle accept-line
     }
     # Prefer the composing hook so a plugin's own line-init widget still runs; fall back to

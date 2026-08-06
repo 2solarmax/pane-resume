@@ -131,11 +131,17 @@ TEMP_ROOTS = ("/var/folders", "/private/var/folders", "/tmp", "/private/tmp")
 
 
 def _is_temp(path):
-    """True for a throwaway directory. Matches the root ITSELF as well as anything under it —
-    a bare "/private/tmp" does not start with "/private/tmp/", and two real bindings sit at
-    exactly that path."""
+    """True for a throwaway directory — something UNDER a temp root, never the root itself.
+
+    The distinction is the whole point. `/private/tmp` is a stable directory that Claude Code
+    files conversations under like any other; 19 real conversations live at exactly that path
+    and were being refused. What gets reaped is a per-session scratchpad BENEATH one —
+    `/private/tmp/claude-501/<some-other-session>/scratchpad/…` — which disappears when the
+    session that owns it ends. Matching the root itself confused a stable folder for a
+    disposable one; matching only what is under it refuses the 150+ scratchpad conversations
+    and allows the rest."""
     rp = os.path.realpath(path or "")
-    return any(rp == t or rp.startswith(t + os.sep) for t in TEMP_ROOTS)
+    return any(rp.startswith(t + os.sep) for t in TEMP_ROOTS)
 
 
 def _project_dirs(path):
@@ -187,7 +193,7 @@ def launch_plan(sid, pwd):
     if not os.path.isdir(target):
         return "NO\tit lived in %s, which no longer exists" % target
     if _is_temp(target):
-        return "NO\tit lived in a temporary folder (%s) — reopen it deliberately with `sess`" % target
+        return "NO\tit lived in a temporary folder (%s) — reopen it with: cd %s && claude --resume %s" % (target, target, sid)
     if projdir not in _project_dirs(target):
         return "NO\tits folder moved; resume cannot find it from %s" % target
     return "CD\t" + target
