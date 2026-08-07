@@ -150,7 +150,30 @@ case "${1:-status}" in
     # same second too, turning the fail-open into exactly the herd this exists to prevent.
     budget=$(( 300 + RANDOM % 120 ))
     mkdir -p "$POOL" 2>/dev/null || true
-    trap 'echo; exit 130' INT TERM   # Ctrl-C aborts the wait; `&&` then skips the launch
+    # While this foreground process holds the tty, the line editor is NOT active. Warp's
+    # periodic `ESC i` IPC (how it reads the input buffer for its UI — bindkey '\ei'
+    # warp_report_input in its shell bootstrap) is no longer intercepted by that binding.
+    # The bytes echo literally as ^[i and accumulate in the kernel input buffer. On a
+    # 60-pane restore they held the tty for ~2.5 minutes, producing the visible garbage.
+    # Suppress echo for the hold, then drain what accumulated before handing control back.
+    _saved_tty=""
+    _drain_tty() {
+      # Consume whatever Warp (or anything else) wrote to the tty during the hold, so it
+      # does not arrive as phantom keypresses in the agent that starts next.
+      [[ -t 0 ]] || return 0
+      stty -echo -icanon min 0 time 1 2>/dev/null || true
+      while IFS= read -t 0.1 -r -n 1 2>/dev/null; do :; done
+      [ -n "$_saved_tty" ] && stty "$_saved_tty" 2>/dev/null || stty echo icanon 2>/dev/null || true
+    }
+    # Define BEFORE stty, and arm an EXIT trap: the terminal must be restored on EVERY exit
+    # path — not just the ones that remember to call _drain_tty. An EXIT trap fires after
+    # INT/TERM/set -e/SIGQUIT and is idempotent (a second call finds nothing to drain).
+    trap '_drain_tty' EXIT
+    trap 'echo; exit 130' INT TERM   # Ctrl-C aborts the wait; EXIT trap drains + restores
+    if [[ -t 0 ]]; then
+      _saved_tty="$(stty -g 2>/dev/null || true)"
+      stty -echo 2>/dev/null || true
+    fi
     deadline=$(( $(date +%s) + budget ))
     got=""; announced=0
     while : ; do
@@ -185,6 +208,7 @@ case "${1:-status}" in
         # FAIL OPEN. A throttle that can withhold a launch forever is worse than the herd it
         # prevents — the whole point is that the session comes back.
         throttle_log "THROTTLE fail-open after ${budget}s -> starting $label anyway"
+        _drain_tty
         exit 0
       fi
       if [[ "$announced" -eq 0 ]]; then
@@ -195,6 +219,7 @@ case "${1:-status}" in
     done
     printf '%s\n' "$$" > "$POOL/$got/owner" 2>/dev/null || true
     throttle_log "SLOT $got -> $label"
+    _drain_tty
     exit 0
     ;;
   slots)
