@@ -400,7 +400,20 @@ def conversation_live(sid):
     # every restored pane would see its own corpse and stand down — which is exactly the
     # 2026-08-23 failure, one gate further along. An agent the USER starts after the relaunch
     # postdates the epoch and is still matched, which is the case this check exists for.
-    cutoff = _epoch_start(warp_epoch())
+    epoch = warp_epoch()
+    cutoff = _epoch_start(epoch)
+    if cutoff is None and epoch:
+        # A non-empty epoch we cannot parse means the timestamp format drifted (a Warp update
+        # changing how lstart renders, say). The filter then silently reverts to matching
+        # every generation — the pre-fix behavior — which is the safe direction but invisible.
+        # One log line so the drift is diagnosable from the next restore's log instead of
+        # being rediscovered as a mystery of duplicated panes.
+        try:
+            with open(os.path.join(RECOV, "resume.log"), "a") as fh:
+                fh.write("%s warp: epoch unparsable (%r) — corpse filter OFF for this check\n"
+                         % (time.strftime("%F %T"), epoch))
+        except Exception:
+            pass
     try:
         fmt = "pid=,lstart=,command=" if cutoff else "pid=,command="
         ps = subprocess.run(["ps", "-Ao", fmt],
