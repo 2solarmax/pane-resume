@@ -374,6 +374,86 @@ def native_resume_present():
     except Exception:
         return False
 
+# --- stand down if the TERMINAL starts resuming agent sessions itself ---------------
+# The Superset half (native_resume_present, above) reads their schema, because their PR told
+# us which columns to look for. For Warp there is no such preview -- nobody knows what their
+# implementation will look like, so a schema guess would be wrong in an unknown direction.
+#
+# What IS knowable is the BEHAVIOUR. If Warp starts restoring agent sessions, then on the
+# first prompt after a restart a pane already has an agent running that we did not launch --
+# which is precisely the condition DE-DUP #2 in the hook already tests, and already skips on.
+# So the detector is not new machinery: it is a tally on a branch that has always existed.
+#
+# The tally is per Warp epoch, so it counts one restart rather than accumulating forever, and
+# it distinguishes a coincidence (you started a session by hand in one pane) from a change in
+# the terminal (many panes came back occupied at once).
+
+_NATIVE_HINT = re.compile(r"agent_session|resume|cli_agent|restored_agent", re.I)
+
+
+def note_preoccupied(epoch):
+    """DE-DUP #2 fired: this pane already had an agent we did not start.
+
+    Prints the new count for this epoch. The hook announces loudly when it crosses
+    SUSPECT_THRESHOLD -- the point is that you FIND OUT the terminal started doing this,
+    not that the tool silently stops (retiring it stays your decision)."""
+    n = 0
+    try:
+        d = os.path.join(RECOV, "preoccupied")
+        os.makedirs(d, exist_ok=True)
+        f = os.path.join(d, epoch or "unknown")
+        with open(f, "a") as fh:
+            fh.write("%d\n" % int(time.time()))
+        n = sum(1 for ln in open(f) if ln.strip())
+    except Exception:
+        pass
+    print(n)
+
+
+SUSPECT_THRESHOLD = 5
+
+
+def warp_native_signals(epoch):
+    """Evidence Warp may have started resuming agent sessions itself.
+
+    preoccupied -- panes that came back with an agent this tool did not launch, this epoch.
+      One or two is ordinary (you started a session by hand). Many at once is the terminal
+      doing it for you.
+    schema_new  -- a new terminal_panes column whose NAME reads like session restoration.
+      Weak alone, but it dates the change, which the behavioural count cannot.
+
+    Returns a dict; the caller decides. Never raises."""
+    out = {"preoccupied": 0, "schema_new": []}
+    try:
+        f = os.path.join(RECOV, "preoccupied", epoch or "unknown")
+        if os.path.exists(f):
+            out["preoccupied"] = sum(1 for ln in open(f) if ln.strip())
+    except Exception:
+        pass
+    try:
+        # Overridable so the schema arm can actually be TESTED. Without a seam here the
+        # positive case is unprovable until the day it matters, which is the day you need
+        # it to be right.
+        db = os.environ.get("PANE_RESUME_WARP_DB") or os.path.join(
+            HOME, "Library", "Group Containers", "2BBY89MBSN.dev.warp",
+            "Library", "Application Support", "dev.warp.Warp-Stable", "warp.sqlite")
+        cols = None
+        if os.path.exists(db):
+            con = sqlite3.connect("file:%s?mode=ro&immutable=1" % db, uri=True, timeout=5)
+            cols = sorted(r[1] for r in con.execute("PRAGMA table_info(terminal_panes)"))
+            con.close()
+        if cols:
+            base = os.path.join(RECOV, "warp-schema-baseline")
+            prev = [c.strip() for c in open(base).read().split("\n") if c.strip()] if os.path.exists(base) else []
+            if not prev:
+                open(base, "w").write("\n".join(cols) + "\n")
+            else:
+                out["schema_new"] = [c for c in cols if c not in prev and _NATIVE_HINT.search(c)]
+    except Exception:
+        pass
+    return out
+
+
 def conversation_live(sid):
     """Is THIS CONVERSATION already running anywhere — in any pane, any terminal?
 
@@ -907,6 +987,18 @@ if __name__ == "__main__":
                     out = titlelib.clean(out) if titlelib else out
                     break
         print(out)
+    elif cmd == "note-preoccupied":
+        note_preoccupied(sys.argv[2] if len(sys.argv) >= 3 else warp_epoch())
+    elif cmd == "warp-native-check":
+        # Reports; never disarms by itself. Whether to stop resuming your own sessions is
+        # yours to decide -- a false positive that silently switched the tool off would look
+        # exactly like the tool being broken, which is the failure this repo exists to prevent.
+        # 5 panes: one restart where most panes came back already occupied. Starting a handful
+        # of sessions by hand in one Warp run does not reach it; Warp restoring them does.
+        sig = warp_native_signals(sys.argv[2] if len(sys.argv) >= 3 else warp_epoch())
+        verdict = "SUSPECTED" if (sig["preoccupied"] >= 5 or sig["schema_new"]) else "none"
+        print("%s preoccupied=%d schema_new=%s"
+              % (verdict, sig["preoccupied"], ",".join(sig["schema_new"]) or "-"))
     elif cmd == "native":
         print("1" if native_resume_present() else "0")
     elif cmd == "agent-descendant" and len(sys.argv) >= 3:

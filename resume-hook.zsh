@@ -220,6 +220,14 @@ if [[ -o interactive ]] \
     # generation, so this question is immune to it by construction, and ~17x cheaper.
     if [[ "$(command python3 "$lib" agent-descendant $$ 2>/dev/null)" == 1 ]]; then
       print -r -- "$(command date '+%F %T') SKIP term=$termid sid=$sid reason=agent-already-under-this-shell" >> "$log" 2>/dev/null
+      # Tally it. If Warp ever ships native session resume, this is what it will look like
+      # from in here: pane after pane coming back already occupied. `warp-native-check`
+      # reports the count so the tool can be retired deliberately rather than by surprise.
+      local n="$(command python3 "$lib" note-preoccupied "$(command python3 "$lib" warp-epoch 2>/dev/null)" 2>/dev/null)"
+      if [[ "$n" -ge 5 ]] && [[ ! -f "$recov/native-suspect-announced-$(command python3 "$lib" warp-epoch 2>/dev/null)" ]]; then
+        command touch "$recov/native-suspect-announced-$(command python3 "$lib" warp-epoch 2>/dev/null)" 2>/dev/null
+        print -r -- $'\033[33m'"pane-resume: ${n} panes came back already occupied this restart -- if you did not start those by hand, Warp may have shipped native session resume. Check: pane-resume status"$'\033[0m' >&2
+      fi
       return 0
     fi
 
