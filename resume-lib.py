@@ -493,11 +493,19 @@ def _epoch_start(epoch):
     parsed, which every caller must treat as "no discrimination available"."""
     if not epoch:
         return None
-    m = re.match(r"^warp-\d+-([A-Za-z]{3}[A-Za-z]{3}\d{1,2}\d{6}\d{4})$", epoch)
+    # The digits are ambiguous once the spaces are stripped: `ps` pads a single-digit day
+    # ("Aug  3"), so day 3 at 08:35:28 becomes "30835282026" — which `%d%H%M%S%Y` reads as
+    # day 30, 27 days in the FUTURE. Every agent would then look pre-epoch, conversation_live
+    # would go blind, and a double resume becomes possible. So parse the tail fields from the
+    # RIGHT (year, then seconds/minutes/hours, whatever is left is the day) instead of
+    # guessing the day's width.
+    m = re.match(r"^warp-\d+-([A-Za-z]{3})([A-Za-z]{3})(\d{1,2})(\d{2})(\d{2})(\d{2})(\d{4})$", epoch)
     if not m:
         return None
+    _wd, mon, day, hh, mm, ss, yr = m.groups()
     try:
-        return time.mktime(time.strptime(m.group(1), "%a%b%d%H%M%S%Y"))
+        return time.mktime(time.strptime(
+            "%s %s %s %s:%s:%s" % (yr, mon, day, hh, mm, ss), "%Y %b %d %H:%M:%S"))
     except Exception:
         return None
 
