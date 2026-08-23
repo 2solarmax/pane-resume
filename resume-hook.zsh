@@ -157,8 +157,33 @@ if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \
     fi
     print -r -- "$(command date '+%F %T') IN-PLACE pane=$WARP_TERMINAL_SESSION_UUID -> $cmd" \
       >> "$recov/resume.log" 2>/dev/null
-    zle -I 2>/dev/null                          # let the line editor repaint around us
-    eval "$cmd"
+    # Submit through the line editor, never `eval` it here. A command eval'd inside this
+    # trap never fires zsh's preexec hook, and Warp builds its per-pane input routing from
+    # the precmd/preexec DCS handshake: with no handshake Warp keeps routing keystrokes to
+    # its own input editor instead of forwarding them to the PTY. The agent renders fine
+    # (output works) but the pane accepts no typing -- all 23 restore-in-place panes went
+    # dead this way 2026-08-23 while every hook-restored pane (ZLE accept-line submit)
+    # typed fine. Submitting via accept-line runs the command through the normal path:
+    # preexec fires, Warp opens a block, keystrokes reach the program.
+    typeset -g _PANE_INPLACE_CMD="$cmd"
+    _pane_inplace_kick() {
+      emulate -L zsh
+      if (( $+functions[add-zle-hook-widget] )); then
+        add-zle-hook-widget -d line-init _pane_inplace_kick 2>/dev/null
+      else
+        zle -D zle-line-init 2>/dev/null
+      fi
+      [[ -n "$_PANE_INPLACE_CMD" ]] || return 0
+      BUFFER="$_PANE_INPLACE_CMD"
+      unset _PANE_INPLACE_CMD
+      zle accept-line
+    }
+    if (( $+functions[add-zle-hook-widget] )); then
+      add-zle-hook-widget line-init _pane_inplace_kick
+    else
+      zle -N zle-line-init _pane_inplace_kick
+    fi
+    zle -I 2>/dev/null                          # repaint: line-init fires, command submits
   }
 fi
 
