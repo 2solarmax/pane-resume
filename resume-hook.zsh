@@ -189,10 +189,19 @@ if [[ -o interactive ]] \
     else
       return 0
     fi
-    [[ -n "$plan" ]] || return 0
+    if [[ -z "$plan" ]]; then
+      # resolve returned nothing: no binding, transcript gone, or a fresh pane. resolve_warp
+      # logs its own reason for the cases it can name; this catches the rest so no pane can
+      # exit this block without an account of why.
+      print -r -- "$(command date '+%F %T') SKIP term=$termid reason=no-resolvable-conversation" >> "$log" 2>/dev/null
+      return 0
+    fi
     IFS=$'\t' read -rA parts <<<"$plan"
     agent="$parts[1]"; sid="$parts[2]"
-    [[ -n "$agent" && -n "$sid" && "$sid" =~ '^[0-9a-fA-F-]{36}$' ]] || return 0
+    if [[ -z "$agent" || -z "$sid" ]] || [[ ! "$sid" =~ '^[0-9a-fA-F-]{36}$' ]]; then
+      print -r -- "$(command date '+%F %T') SKIP term=$termid reason=malformed-plan" >> "$log" 2>/dev/null
+      return 0
+    fi
 
     # DE-DUP #1 (Superset migration): once Superset ships native cold-restore auto-resume
     # (superset-sh/superset#5246), stand down and disarm so we never double-resume. Warp
@@ -204,8 +213,13 @@ if [[ -o interactive ]] \
     fi
     # DE-DUP #2 (backstop): if an agent is already running in this pane (manual/native beat
     # us to it), skip — never start a second. Matches both pane-id env vars.
-    if [[ "$(command python3 "$lib" agent-running "$termid" 2>/dev/null)" == 1 ]]; then
-      print -r -- "$(command date '+%F %T') agent already running in pane — skipped (dedup)" >> "$log" 2>/dev/null
+    # Ask about THIS SHELL, not about the pane uuid. Warp reuses pane uuids across a restart,
+    # so "is an agent bound to this pane?" is answered TRUE by the pane's own dying agent from
+    # the previous run — which on 2026-08-23 silently skipped 22 of 56 panes while the old
+    # agents took 19 seconds to exit. A new shell's process tree cannot contain the old
+    # generation, so this question is immune to it by construction, and ~17x cheaper.
+    if [[ "$(command python3 "$lib" agent-descendant $$ 2>/dev/null)" == 1 ]]; then
+      print -r -- "$(command date '+%F %T') SKIP term=$termid sid=$sid reason=agent-already-under-this-shell" >> "$log" 2>/dev/null
       return 0
     fi
 
@@ -221,7 +235,10 @@ if [[ -o interactive ]] \
     else
       bootid="$(command python3 "$lib" bootid 2>/dev/null)"
     fi
-    [[ -n "$bootid" ]] || return 0
+    if [[ -z "$bootid" ]]; then
+      print -r -- "$(command date '+%F %T') SKIP term=$termid sid=$sid reason=no-epoch-id" >> "$log" 2>/dev/null
+      return 0
+    fi
     # opportunistically reap other-boot lock dirs (bounded on-disk state); slots/ is
     # legacy stagger state (removed 2026-07-14) — clear it entirely if still present
     command find "$recov/locks" -mindepth 1 -maxdepth 1 -type d ! -name "$bootid" -exec rm -rf {} + 2>/dev/null
@@ -240,12 +257,17 @@ if [[ -o interactive ]] \
     if [[ -d "$lockdir" && ! -e "$lockdir/exec" ]]; then
       local lpid="$(command cat "$lockdir/pid" 2>/dev/null)"
       if [[ -n "$lpid" ]] && ! command kill -0 "$lpid" 2>/dev/null \
-         && [[ "$(command python3 "$lib" agent-running "$termid" 2>/dev/null)" != 1 ]]; then
+         && [[ "$(command python3 "$lib" agent-descendant $$ 2>/dev/null)" != 1 ]]; then
         command rm -rf "$lockdir" 2>/dev/null
         print -r -- "$(command date '+%F %T') reclaimed stale lock (owner $lpid dead, no agent) term=$termid" >> "$log" 2>/dev/null
       fi
     fi
-    command mkdir "$lockdir" 2>/dev/null || return 0   # atomic one-shot
+    if ! command mkdir "$lockdir" 2>/dev/null; then   # atomic one-shot
+      # Already resumed once in this terminal run. Expected on a re-sourced .zshrc; logged so
+      # a pane that "did nothing" is never unexplained.
+      print -r -- "$(command date '+%F %T') SKIP term=$termid sid=$sid reason=already-resumed-this-run" >> "$log" 2>/dev/null
+      return 0
+    fi
     print -r -- "$$" > "$lockdir/pid" 2>/dev/null      # owner PID -> stale-lock reclaim above
 
     # ── ONE PANE PER CONVERSATION ────────────────────────────────────────────────────

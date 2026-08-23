@@ -394,14 +394,35 @@ def conversation_live(sid):
     anything else from the process table, which on this machine can carry secrets."""
     if not UUID_RE.match(sid or ""):
         return False
+    # Ignore agents that predate the current terminal run. Warp reuses pane uuids across a
+    # restart, so during the ~19 seconds the previous run's agents take to exit, each one is
+    # still running `--resume <the very sid this pane is about to resume>`. Without this,
+    # every restored pane would see its own corpse and stand down — which is exactly the
+    # 2026-08-23 failure, one gate further along. An agent the USER starts after the relaunch
+    # postdates the epoch and is still matched, which is the case this check exists for.
+    cutoff = _epoch_start(warp_epoch())
     try:
-        ps = subprocess.run(["ps", "-Ao", "pid=,command="],
+        fmt = "pid=,lstart=,command=" if cutoff else "pid=,command="
+        ps = subprocess.run(["ps", "-Ao", fmt],
                             capture_output=True, text=True, timeout=15).stdout
     except Exception:
         return False          # cannot tell -> do NOT block a restore
     want = sid.lower()
     for line in ps.splitlines():
-        head = line.strip().split(" ", 1)
+        if cutoff:
+            m = re.match(r"\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4})\s+(.*)", line)
+            if not m:
+                continue
+            try:
+                started = time.mktime(time.strptime(m.group(2), "%a %b %d %H:%M:%S %Y"))
+            except Exception:
+                started = None
+            # Older than this terminal run -> a corpse from the previous generation.
+            if started is not None and started < cutoff - 2:
+                continue
+            head = [m.group(1), m.group(3)]
+        else:
+            head = line.strip().split(" ", 1)
         if len(head) < 2:
             continue
         cmd = head[1]
@@ -462,6 +483,73 @@ def claim_conversation(sid, epoch):
     except Exception:
         return True                            # fail OPEN
     return True
+
+
+def _epoch_start(epoch):
+    """Unix seconds at which the terminal run named by `epoch` began.
+
+    The epoch id already carries it — `warp-91301-SunAug230835282026` is the app's pid plus
+    its start time — so no extra process read is needed. Returns None when it cannot be
+    parsed, which every caller must treat as "no discrimination available"."""
+    if not epoch:
+        return None
+    m = re.match(r"^warp-\d+-([A-Za-z]{3}[A-Za-z]{3}\d{1,2}\d{6}\d{4})$", epoch)
+    if not m:
+        return None
+    try:
+        return time.mktime(time.strptime(m.group(1), "%a%b%d%H%M%S%Y"))
+    except Exception:
+        return None
+
+
+def agent_descendant(pid):
+    """Is an agent running UNDER this shell — the only occupancy question that is safe to ask.
+
+    The check this replaces asked "is an agent bound to this PANE UUID", by reading every
+    agent process's environment. Warp reuses pane uuids across a restart, so on 2026-08-23
+    that question was answered TRUE by each pane's OWN DYING AGENT from the previous run —
+    correctly, by its own contract, and catastrophically: 22 of 56 panes silently skipped
+    their resume while the old agents took 19 seconds to exit.
+
+    A new shell in a restored pane has an empty process tree; the old agent hangs off the OLD
+    shell, which is already gone. So "do I have an agent under me" cannot see the previous
+    generation at all, and needs no timestamps to avoid it.
+
+    Descendants, not children: the launch goes through `zsh -ic`, so the tree is
+    shell -> zsh -> claude. A bare child test would be true for every pane the moment
+    anything ran, and would also fire on a .zshrc plugin's background helper — silently
+    skipping every pane on the machine."""
+    try:
+        pid = int(pid)
+    except Exception:
+        return False
+    try:
+        out = subprocess.run(["ps", "-Ao", "pid=,ppid=,comm="],
+                             capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return False          # cannot tell -> never block a restore
+    kids = {}
+    name = {}
+    for line in out.splitlines():
+        f = line.split(None, 2)
+        if len(f) < 3:
+            continue
+        try:
+            p, pp = int(f[0]), int(f[1])
+        except ValueError:
+            continue
+        kids.setdefault(pp, []).append(p)
+        name[p] = os.path.basename(f[2].strip().lstrip("-"))
+    seen, stack = set(), list(kids.get(pid, []))
+    while stack:
+        q = stack.pop()
+        if q in seen:
+            continue
+        seen.add(q)
+        if name.get(q, "") in ("claude", "codex", "gemini"):
+            return True
+        stack.extend(kids.get(q, []))
+    return False
 
 
 def agent_running(term_id):
@@ -800,6 +888,8 @@ if __name__ == "__main__":
         print(out)
     elif cmd == "native":
         print("1" if native_resume_present() else "0")
+    elif cmd == "agent-descendant" and len(sys.argv) >= 3:
+        print("1" if agent_descendant(sys.argv[2]) else "0")
     elif cmd == "agent-running" and len(sys.argv) >= 3:
         print("1" if agent_running(sys.argv[2]) else "0")
     elif cmd == "conversation-live" and len(sys.argv) >= 3:
