@@ -60,6 +60,33 @@ def main():
                 os.replace(tmp, path)   # atomic publish
             except OSError:
                 pass
+        # SESSION HISTORY — the binding above is a single slot that each SessionStart
+        # overwrites, so a short-lived crash-debris session can evict the pane's real
+        # long-lived one (2026-08-31: a seconds-old /private/tmp session evicted the
+        # maxpool binding; its own transcript was gone, the pane refused to resume, and
+        # maxpool had to be hand-restored). The history keeps the pane's recent sessions
+        # so the resolver can fall back. Newest first, dedup by sid, capped.
+        # A failure here must never disturb the primary binding.
+        try:
+            hpath = os.path.join(os.path.dirname(bdir), "warp-history", uuid)
+            os.makedirs(os.path.dirname(hpath), exist_ok=True)
+            prev = []
+            try:
+                with open(hpath) as fh:
+                    prev = [ln.strip() for ln in fh if ln.strip()]
+            except OSError:
+                pass
+            ts = int(__import__("time").time())
+            entry = "%s\t%s\t%d" % (cwd, sid, ts)
+            prev = [e for e in prev if e.split("\t")[1:2] != [sid]]   # dedup: a re-run moves to front
+            prev.insert(0, entry)
+            prev = prev[:10]                                             # cap
+            tmp = hpath + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.write("\n".join(prev) + "\n")
+            os.replace(tmp, hpath)
+        except Exception:
+            pass
 
     elif ev == "SessionEnd":
         ending = data.get("session_id") or ""
@@ -89,6 +116,23 @@ def main():
         # (~/.claude/sessions/<pid>.json) is the liveness source.
         if reason == "prompt_input_exit" and ending:
             sid = ending if UUID_RE.match(ending) else ""
+            # The HISTORY prune is NOT behind the liveness guard: a deliberate quit must
+            # never be resurrected by the fallback, whatever else is running — the guard
+            # exists for the BINDING's different failure (a same-pane hand --resume fires
+            # prompt_input_exit transitively and must keep its target resumable). A quit
+            # session being resumed by hand elsewhere writes its own fresh history entry
+            # at that pane's next SessionStart, so nothing is lost.
+            try:
+                hpath = os.path.join(os.path.dirname(bdir), "warp-history", uuid)
+                with open(hpath) as fh:
+                    keep = [ln.strip() for ln in fh
+                            if ln.strip() and ln.strip().split("\t")[1:2] != [sid]]
+                tmp = hpath + ".tmp"
+                with open(tmp, "w") as fh:
+                    fh.write("\n".join(keep) + ("\n" if keep else ""))
+                os.replace(tmp, hpath)
+            except OSError:
+                pass
             if sid and not _sid_live_elsewhere(sid):
                 for path in (bpath, lpath):
                     try:

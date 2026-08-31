@@ -807,6 +807,25 @@ def resolve_warp(uuid):
         return ""
     # transcript must still exist, else `claude --resume` starts a FRESH session
     if not _transcript_exists("claude", cwd, sid):
+        # FALLBACK: the binding is a single slot that SessionStart overwrites, so the
+        # dead sid may be crash debris that evicted the pane's real session (2026-08-31:
+        # maxpool). The pane's own history knows what else ran here. Resume the newest
+        # entry whose transcript still exists; a deliberately-quit sid is never in the
+        # history (SessionEnd removes it), so this cannot resurrect a quit session.
+        hpath = os.path.join(RECOV, "warp-history", uuid)
+        try:
+            with open(hpath) as fh:
+                entries = [ln.strip().split("\t") for ln in fh if ln.strip()]
+        except OSError:
+            entries = []
+        for i, e in enumerate(entries):
+            if len(e) < 2 or e[1] == sid:
+                continue
+            hcwd, hsid = e[0], e[1]
+            if _transcript_exists("claude", hcwd, hsid):
+                _wlog("transcript gone for %s (pane %s) — resuming %s from history (entry %d of %d)"
+                      % (sid[:8], uuid[:8], hsid[:8], i + 1, len(entries)))
+                return "claude\t%s" % hsid
         _wlog("transcript gone for %s (pane %s) — no resume" % (sid[:8], uuid[:8]))
         return ""
     # The directory question is NOT answered here any more. It used to compare the binding's
