@@ -402,7 +402,16 @@ if [[ -o interactive ]] \
         # SUBSHELL, so a failed cd cannot swallow the launch (`cd x && cmd` losing a session
         # is a mistake this repo has already made) and the pane keeps its own directory.
         if [[ -n "$_plan_parts[2]" && -d "$_plan_parts[2]" ]]; then
-          base=( "(" cd -- "${(q)_plan_parts[2]}" "&&" "${(@)base}" ")" )
+          # The structural parens must NOT be escape-quoted downstream. 2026-09-12: the
+          # join that builds the typed line quote-escapes every word, so the subshell
+          # opener became a literal `(` — "zsh: command not found: (" — and the pane
+          # silently never resumed (the only crash since CD-wrap shipped, 57/58 panes
+          # fine because their sessions lived in the pane's own cwd). Keep the parens in
+          # a separate variable the join never touches; only the PATH and the command
+          # words go through (q).
+          typeset -g _PANE_RESUME_PREFIX="( "
+          typeset -g _PANE_RESUME_SUFFIX=" )"
+          base=( cd -- "${(q)_plan_parts[2]}" "&&" "${(@)base}" )
           print -r -- "$(command date '+%F %T')   -> launching from ${_plan_parts[2]}" >> "$log" 2>/dev/null
         fi
         ;;
@@ -439,7 +448,8 @@ if [[ -o interactive ]] \
     # A throttle must never be able to fail closed.
     local _wait=""
     [[ -x "$recov/superset-resume" ]] && _wait="${(q)recov}/superset-resume wait-slot && "
-    typeset -g _SUPERSET_RESUME_CMD="${_wait}${(j: :)${(q)base[@]}}"
+    local _prefix="${_PANE_RESUME_PREFIX:-}" _suffix="${_PANE_RESUME_SUFFIX:-}"
+    typeset -g _SUPERSET_RESUME_CMD="${_wait}${_prefix}${(j: :)${(q)base[@]}}${_suffix}"
     # A copy the widget compares against, so a corrupted line is caught with its bytes.
     typeset -g _SUPERSET_RESUME_EXPECT="$_SUPERSET_RESUME_CMD"
     _superset_resume_kick() {
@@ -465,6 +475,10 @@ if [[ -o interactive ]] \
       if [[ "$BUFFER" != "$_SUPERSET_RESUME_EXPECT" ]]; then
         print -r -- "$(command date '+%F %T')   -> BUFFER DIFFERS at submit: ${(qqq)BUFFER}" \
           >> "$HOME/.superset-recovery/resume.log" 2>/dev/null
+        # 2026-09-12: logging alone let a corrupted line execute ("command not found: (")
+        # and silently skip the pane for the whole run. A corrupted resume line is never
+        # the user's intent — submit the CLEAN command instead of the corrupted bytes.
+        BUFFER="$_SUPERSET_RESUME_EXPECT"
       fi
       unset _SUPERSET_RESUME_EXPECT
       zle accept-line
