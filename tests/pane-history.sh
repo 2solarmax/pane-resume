@@ -77,3 +77,32 @@ fire2 "$TMP/m1.py" '{"hook_event_name":"SessionStart","session_id":"99999999-888
 ck "cap=1 mutant caught (eviction)" "$(wc -l < $H | tr -d ' ')" "1"   # healthy impl keeps 2
 
 print ""; print "$pass passed, $fail failed"; [[ $fail -eq 0 ]]
+
+print "folder-gone fallback (2026-09-30: commit-gate worktree deleted, blocked the pane's real session)"
+# binding points at GONE (transcript exists, worktree deleted), real session STILL is in history with transcript + live folder
+GONE=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+STILL=12345678-90ab-cdef-1234-567890abcdef
+TAB=$'\t'
+mkdir -p "$TMP/.claude/projects/-private-tmp" "$TMP/live-dir"
+mktranscript $GONE
+mktranscript $STILL
+print "$TMP/gone-dir${TAB}$GONE" > "$TMP/.superset-recovery/warp-bindings/$PANE"
+printf '%s\t%s\n%s\t%s\n' "$TMP/gone-dir" $GONE "$TMP/live-dir" $STILL > $H
+r=$(env HOME=$TMP python3 "$LIB" resolve-warp $PANE 2>/dev/null | tail -1)
+ck "folder gone: falls back to live session" "$r" "claude${TAB}$STILL"
+grep -q "resuming ${STILL:0:8} from history" $TMP/.superset-recovery/resume.log && ck "folder-gone fallback logged" "yes" "yes" || ck "folder-gone fallback logged" "no" "yes"
+
+print "folder-gone: no candidate whose folder survives -> binding unchanged, launch_plan explains"
+rm -rf "$TMP/live-dir"
+r=$(env HOME=$TMP python3 "$LIB" resolve-warp $PANE 2>/dev/null | tail -1)
+ck "no live alternative: keeps binding (reason shown by launch-plan)" "$r" "claude${TAB}$GONE"
+
+print "mutant: fallback ignoring need_dir would resume a session whose folder is ALSO gone"
+GONE2=dead0000-beef-0000-0000-000000000000
+mktranscript $GONE2
+printf '%s\t%s\n' "$TMP/other-gone" $GONE2 >> $H
+r=$(env HOME=$TMP python3 "$LIB" resolve-warp $PANE 2>/dev/null | tail -1)
+ck "transcript exists but folder gone: NOT chosen" "$r" "claude${TAB}$GONE"
+
+print "result: $pass passed, $fail failed"
+[[ $fail -eq 0 ]] || exit 1

@@ -777,6 +777,27 @@ def _wlog(msg):
         pass
 
 
+
+def _history_resume(uuid, sid, need_dir):
+    """Newest other history entry for this pane that is still resumable — transcript on
+    disk, and (need_dir) its own folder still present. Newest first; returns sid or None."""
+    hpath = os.path.join(RECOV, "warp-history", uuid)
+    try:
+        with open(hpath) as fh:
+            entries = [ln.strip().split("\t") for ln in fh if ln.strip()]
+    except OSError:
+        entries = []
+    for i, e in enumerate(entries):
+        if len(e) < 2 or e[1] == sid:
+            continue
+        hcwd, hsid = e[0], e[1]
+        if _transcript_exists("claude", hcwd, hsid) and (not need_dir or os.path.isdir(hcwd)):
+            _wlog("falling back for %s (pane %s) — resuming %s from history (entry %d of %d)"
+                  % (sid[:8], uuid[:8], hsid[:8], i + 1, len(entries)))
+            return hsid
+    return None
+
+
 def resolve_warp(uuid):
     """Warp restore resolver (claude). Returns '<agent>\\t<sid>' (launcher chosen by the
     hook) or '' for no-resume. '' on: no binding (fresh tab / cleanly-exited / uuid not
@@ -812,22 +833,20 @@ def resolve_warp(uuid):
         # maxpool). The pane's own history knows what else ran here. Resume the newest
         # entry whose transcript still exists; a deliberately-quit sid is never in the
         # history (SessionEnd removes it), so this cannot resurrect a quit session.
-        hpath = os.path.join(RECOV, "warp-history", uuid)
-        try:
-            with open(hpath) as fh:
-                entries = [ln.strip().split("\t") for ln in fh if ln.strip()]
-        except OSError:
-            entries = []
-        for i, e in enumerate(entries):
-            if len(e) < 2 or e[1] == sid:
-                continue
-            hcwd, hsid = e[0], e[1]
-            if _transcript_exists("claude", hcwd, hsid):
-                _wlog("transcript gone for %s (pane %s) — resuming %s from history (entry %d of %d)"
-                      % (sid[:8], uuid[:8], hsid[:8], i + 1, len(entries)))
-                return "claude\t%s" % hsid
+        hsid = _history_resume(uuid, sid, need_dir=False)
+        if hsid:
+            return "claude\t%s" % hsid
         _wlog("transcript gone for %s (pane %s) — no resume" % (sid[:8], uuid[:8]))
         return ""
+    # FALLBACK 2: the session's FOLDER can vanish too — a worktree is deleted once its
+    # work lands (2026-09-30: commit-gate, a one-message SDK test session, outlived its
+    # worktree by a day and blocked the pane's real session from restoring). Same
+    # eviction story; same cure. Without an alternative we return the binding UNCHANGED
+    # so launch_plan still prints the folder reason in the pane.
+    if not os.path.isdir(cwd):
+        hsid = _history_resume(uuid, sid, need_dir=True)
+        if hsid:
+            return "claude\t%s" % hsid
     # The directory question is NOT answered here any more. It used to compare the binding's
     # cwd against Warp's own record of the pane, and that comparison was a race it lost:
     # during a cold restore Warp has usually not written the row yet, so it logged "not yet in
