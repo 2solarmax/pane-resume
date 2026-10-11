@@ -526,8 +526,109 @@ def conversation_live(sid):
             continue
         m = re.search(r"--resume\s+([0-9a-fA-F-]{36})", cmd)
         if m and m.group(1).lower() == want:
-            return True
+            # A copy with NO WINDOW does not count as "running". 2026-10-11: 21 tabs saw an
+            # invisible copy (its Warp window had relaunched away, shell re-parented to
+            # launchd), stood down, and stayed empty — the conversation was alive yet nobody
+            # could see or type into it. Only a copy you can actually reach blocks this tab.
+            if _has_window(int(head[0]), sid):
+                return True
+            # N2: a windowless copy that is still WORKING would become a second writer if we
+            # restore over it. Its transcript changing in the last 30s is the sign it is busy;
+            # then this tab stands down (with its explanation) rather than racing it.
+            if _transcript_recent(sid, 30):
+                try:
+                    with open(os.path.join(RECOV, "resume.log"), "a") as fh:
+                        fh.write("%s warp: WINDOWLESS-BUT-BUSY pid=%s sid=%s (standing down)\n"
+                                 % (time.strftime("%F %T"), head[0], sid))
+                except Exception:
+                    pass
+                return True
+            # Ignored on purpose — log it, so a hidden second writer is never silent.
+            try:
+                with open(os.path.join(RECOV, "resume.log"), "a") as fh:
+                    fh.write("%s warp: IGNORED-WINDOWLESS pid=%s sid=%s (no window; this tab restores)\n"
+                             % (time.strftime("%F %T"), head[0], sid))
+            except Exception:
+                pass
     return False
+
+
+def _transcript_recent(sid, secs):
+    """Was this conversation's transcript written in the last `secs` seconds?"""
+    try:
+        m = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", f"{sid}.jsonl"))
+        return bool(m) and (time.time() - os.path.getmtime(m[0])) < secs
+    except Exception:
+        return False
+
+
+def _sid_has_warp_record(sid):
+    """True when some Warp pane has recorded this conversation (warp-last/ or warp-history/)."""
+    if not sid:
+        return False
+    for d in ("warp-last", "warp-bindings", "warp-history"):
+        root = os.path.join(RECOV, d)
+        try:
+            for name in os.listdir(root):
+                try:
+                    with open(os.path.join(root, name)) as fh:
+                        if sid in fh.read():
+                            return True
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return False
+
+
+def _has_window(pid, sid=None):
+    """Does this agent still hang under a live terminal window?
+
+    Only for WARP panes: when Warp's window goes away its pane shells are re-parented to
+    launchd (pid 1) and the agent under them keeps running invisibly (2026-10-11). Superset's
+    pty-daemon hands its terminals to a successor on upgrade and then exits, which ALSO
+    re-parents its still-visible shells to launchd — so the launchd signature only means
+    "windowless" for a process that is a Warp pane (WARP_TERMINAL_SESSION_UUID in its env).
+    Anything else, any read failure, or a chain that meets a terminal host first -> True.
+    Ignoring a windowless copy CAN create a second writer if that copy is still working —
+    conversation_live guards that with a recent-write check before it ignores one.
+    PANE_RESUME_TEST_ORPHANS (comma pids) exists for the isolated test harness only."""
+    fake = os.environ.get("PANE_RESUME_TEST_ORPHANS")
+    if fake is not None:
+        return str(pid) not in fake.split(",")
+    try:
+        # Is this a Warp pane's agent? The pane id lives in the process ENVIRONMENT, and
+        # macOS does not reliably expose another process's environment through ps (a process
+        # that rewrites its argv area hides it — caught by tests/window-gone.sh B). The
+        # durable record is ours: every agent this tool or a Warp pane started has a binding
+        # in warp-last/ naming its sid. An agent we have no Warp record of -> not ours to
+        # judge -> True. The sid is passed in by conversation_live.
+        env = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout
+        if "WARP_TERMINAL_SESSION_UUID=" in env:
+            pass                               # a Warp pane's agent: the launchd rule applies
+        elif re.search(r"\s[A-Z_][A-Z0-9_]*=", env):
+            return True                        # env readable and NOT Warp: launchd proves nothing
+        elif not _sid_has_warp_record(sid):
+            return True                        # env unreadable, no Warp record: not ours to judge
+        p = pid
+        for _ in range(6):
+            out = subprocess.run(["ps", "-o", "ppid=", "-p", str(p)],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+            if not out:
+                return True
+            ppid = int(out)
+            if ppid == 1:
+                return False
+            comm = subprocess.run(["ps", "-o", "comm=", "-p", str(ppid)],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+            base = os.path.basename(comm).lstrip("-")
+            if base not in ("zsh", "bash", "sh", "claude", "node", "cc"):
+                return True                    # reached a terminal host (Warp, tmux, …)
+            p = ppid
+        return True
+    except Exception:
+        return True
 
 
 def claim_conversation(sid, epoch):

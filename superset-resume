@@ -65,6 +65,45 @@ throttle_log() {
   printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$RECOV/resume.log" 2>/dev/null || true
 }
 
+# Is THIS pane's window still there, right now? Asked of the pane itself at the moment the
+# wait ends — never of a run id computed when the resume was queued. (Round-2 red-team N1: an
+# id from a lowest-pid pick during a relaunch overlap can name the OLD app for a NEW-run pane,
+# and comparing ids then refuses a healthy tab.) A Warp pane shell is a child of Warp's
+# `terminal-server --parent-pid=<app>`; the window is gone when that chain is broken:
+#   - the pane shell itself was re-parented to launchd, or
+#   - the terminal-server's app pid is gone.
+# --epoch only marks the caller as a Warp pane (enables the check); its value is not compared.
+# Any read failure answers "window present" — this can never refuse on uncertainty.
+_pane_window_gone() {
+  local shell_ppid ts_cmd app
+  if [[ -n "${PANE_RESUME_TEST_SHELL_PPID+x}" ]]; then shell_ppid="$PANE_RESUME_TEST_SHELL_PPID"   # test harness only
+  else shell_ppid="$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ' || true)"; fi
+  [[ -z "$shell_ppid" ]] && return 1
+  [[ "$shell_ppid" == 1 ]] && return 0
+  if [[ -n "${PANE_RESUME_TEST_TS_CMD+x}" ]]; then ts_cmd="$PANE_RESUME_TEST_TS_CMD"               # test harness only
+  else ts_cmd="$(ps -o command= -p "$shell_ppid" 2>/dev/null || true)"; fi
+  [[ "$ts_cmd" =~ --parent-pid=([0-9]+) ]] || return 1        # not a Warp terminal-server: nothing to judge
+  app="${BASH_REMATCH[1]}"
+  if [[ -n "${PANE_RESUME_TEST_LIVE_PIDS+x}" ]]; then                                             # test harness only
+    [[ " $PANE_RESUME_TEST_LIVE_PIDS " == *" $app "* ]] && return 1 || return 0
+  fi
+  kill -0 "$app" 2>/dev/null && return 1
+  ps -p "$app" >/dev/null 2>&1 && return 1                    # alive but not ours to signal (EPERM)
+  return 0
+}
+# One gate for every path about to let a launch through. Logs, tells the pane, returns 0 when
+# the launch must be refused.
+_refuse_if_window_gone() {
+  [[ -n "$want_epoch" ]] || return 1
+  if _pane_window_gone; then
+    throttle_log "WINDOW-GONE $label -> launch refused (its Warp window closed while it waited)"
+    printf '\033[33m%s not resumed: this pane\047s Warp window closed while it waited (%s)%s\n' \
+      "$( [ -t 2 ] && printf '\xe2\x96\xb8 ' || printf '=> ' )" "$label" '\033[0m' >&2 || true
+    return 0
+  fi
+  return 1
+}
+
 in_warp() { [[ "${TERM_PROGRAM:-}" == "WarpTerminal" && -n "${WARP_TERMINAL_SESSION_UUID:-}" ]]; }
 has_superset() { [[ -n "${SUPERSET_TERMINAL_ID:-}" ]] || compgen -G "$HOME/.superset/host/*/host.db" >/dev/null 2>&1; }
 
@@ -143,12 +182,17 @@ case "${1:-status}" in
     ;;
   wait-slot)
     shift || true
+    # --epoch <warp run id>: the Warp run this pane's shell was born in. Re-checked when the
+    # wait ENDS, because that is when the launch happens and the window may be gone by then.
+    want_epoch=""
+    if [[ "${1:-}" == "--epoch" ]]; then want_epoch="${2:-}"; shift 2 || shift $#; fi
     label="${*:-agent}"
     cap="$(throttle_cap)"; settle="$(throttle_settle)"
     # Never block a pane longer than this, no matter what. Jittered because every waiter in a
     # restore starts at the same instant: with a fixed budget they would all give up at the
     # same second too, turning the fail-open into exactly the herd this exists to prevent.
     budget=$(( 300 + RANDOM % 120 ))
+    [[ -n "${PANE_RESUME_TEST_BUDGET:-}" ]] && budget="$PANE_RESUME_TEST_BUDGET"   # test harness only
     mkdir -p "$POOL" 2>/dev/null || true
     # While this foreground process holds the tty, the line editor is NOT active. Warp's
     # periodic `ESC i` IPC (how it reads the input buffer for its UI — bindkey '\ei'
@@ -207,6 +251,8 @@ case "${1:-status}" in
       if [[ "$(date +%s)" -ge "$deadline" ]]; then
         # FAIL OPEN. A throttle that can withhold a launch forever is worse than the herd it
         # prevents — the whole point is that the session comes back.
+        # F2: the give-up path is a launch too — the window check applies here as well.
+        if _refuse_if_window_gone; then _drain_tty; exit 3; fi
         throttle_log "THROTTLE fail-open after ${budget}s -> starting $label anyway"
         _drain_tty
         exit 0
@@ -218,6 +264,18 @@ case "${1:-status}" in
       sleep 0.4
     done
     printf '%s\n' "$$" > "$POOL/$got/owner" 2>/dev/null || true
+    # The window this launch belongs to must still exist. A different (or absent) Warp run
+    # means the app quit or relaunched while we waited: launching now would start an agent
+    # nobody can see or type into. Refuse with a non-zero exit so `&&` skips the launch, and
+    # give the slot back at once. Only an AFFIRMATIVE mismatch refuses — if the epoch cannot
+    # be read at all we launch, because a resume that never happens is the worse failure.
+    if _refuse_if_window_gone; then
+      # F10: give the slot back only if it is still OURS — a slow check can outlive the
+      # settle time, and another waiter may already hold this slot number.
+      [[ "$(cat "$POOL/$got/owner" 2>/dev/null)" == "$$" ]] && rm -rf "$POOL/$got" 2>/dev/null || true
+      _drain_tty
+      exit 3
+    fi
     throttle_log "SLOT $got -> $label"
     _drain_tty
     exit 0

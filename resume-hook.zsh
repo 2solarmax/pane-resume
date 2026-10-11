@@ -200,6 +200,21 @@ if [[ -o interactive ]] \
     local -a parts base
     lib="$recov/resume-lib.py"; log="$recov/resume.log"
     [[ -f "$lib" ]] || return 0
+    # A tab this hook leaves empty must say WHICH conversation it held and why it is empty.
+    # 2026-10-11: 21 tabs came back as a bare prompt with only the first message as their
+    # label; finding the right session took an hour of guessing. No reopen line here: these
+    # paths fire only when the conversation is live in another tab, and reopening it here
+    # would make a second visible copy writing the same transcript.
+    _pane_resume_explain() {
+      local why="$1" s="$2"
+      local name
+      name="$(command python3 "$lib" label "$s" 2>/dev/null)"
+      print -r -- ""
+      print -Pn "%F{yellow}▸%f "
+      # F6: the label is user prose — never through print -P (a title with %F{red} or %~ would
+      # expand). Same discipline as the title hook's `print -r --`.
+      print -r -- "${name:-this conversation} $why"
+    }
 
     # 1) Detect the terminal + resolve FIRST. Each resolver is existence-checked (the
     #    transcript must still exist) and returns empty on any transient/absent case, so a
@@ -315,6 +330,7 @@ if [[ -o interactive ]] \
     if [[ -n "$sid" ]]; then
       if [[ "$(command python3 "$lib" conversation-live "$sid" 2>/dev/null)" == 1 ]]; then
         print -r -- "$(command date '+%F %T') STAND-DOWN term=$termid sid=$sid reason=already-running-elsewhere" >> "$log" 2>/dev/null
+        _pane_resume_explain "is already open in another tab — this one stays empty" "$sid"
         export _SUPERSET_RESUME_DONE=1
         return 0
       fi
@@ -325,6 +341,7 @@ if [[ -o interactive ]] \
       # burned, which is the opposite of what this file promises everywhere else.
       if [[ "$(command python3 "$lib" claim "$sid" "$bootid" 2>/dev/null)" == 0 ]]; then
         print -r -- "$(command date '+%F %T') STAND-DOWN term=$termid sid=$sid reason=another-pane-claimed-it" >> "$log" 2>/dev/null
+        _pane_resume_explain "is being reopened in another tab — this one stays empty" "$sid"
         export _SUPERSET_RESUME_DONE=1
         return 0
       fi
@@ -394,6 +411,7 @@ if [[ -o interactive ]] \
         print -r -- ""
         print -Pn "%F{yellow}▸ not resumed:%f "
         print -r -- "${_plan_parts[2]:-reason unavailable}"
+        print -r -- "  conversation: $(command python3 "$lib" label "$sid" 2>/dev/null) ($sid)"
         print -r -- "$(command date '+%F %T')   -> NOT RESUMED sid=$sid reason=${_plan_parts[2]}" >> "$log" 2>/dev/null
         return 0
         ;;
@@ -447,7 +465,20 @@ if [[ -o interactive ]] \
     # a PATH hiccup returns "command not found", `&&` swallows the launch, and NOTHING resumes.
     # A throttle must never be able to fail closed.
     local _wait=""
-    [[ -x "$recov/superset-resume" ]] && _wait="${(q)recov}/superset-resume wait-slot && "
+    # The epoch rides along so wait-slot can refuse a launch into a window that is gone.
+    # 2026-10-11: Warp relaunched mid-restore; 76 queued resumes in the OLD run's shells kept
+    # launching for 2.5 minutes into terminals with no window, and the new run's tabs then saw
+    # those invisible copies as "already running" and stayed empty. Queue time is the wrong
+    # moment to check — the window was alive then. The check belongs where the wait ends.
+    # --epoch only when bootid is a REAL Warp-run id (warp-…). It can be the numeric boot-id
+    # fallback when ps timed out or Warp wasn't listed yet; that number can never equal a
+    # later warp-… reading, and refusing on the difference would refuse a HEALTHY pane
+    # (red-team F1: reproduced as a silent exit-3 on an attached shell).
+    if (( is_warp )) && [[ "$bootid" == warp-* ]] && [[ -x "$recov/superset-resume" ]]; then
+      _wait="${(q)recov}/superset-resume wait-slot --epoch ${(q)bootid} agent:${sid} && "
+    elif [[ -x "$recov/superset-resume" ]]; then
+      _wait="${(q)recov}/superset-resume wait-slot && "
+    fi
     local _prefix="${_PANE_RESUME_PREFIX:-}" _suffix="${_PANE_RESUME_SUFFIX:-}"
     typeset -g _SUPERSET_RESUME_CMD="${_wait}${_prefix}${(j: :)${(q)base[@]}}${_suffix}"
     # A copy the widget compares against, so a corrupted line is caught with its bytes.
