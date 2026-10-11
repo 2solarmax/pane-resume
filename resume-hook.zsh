@@ -278,7 +278,7 @@ if [[ -o interactive ]] \
     #             quit a session it STAYS quit (the 2026-07-27 "can't Ctrl-C out" loop).
     #    Superset -> the boot (unchanged).
     if (( is_warp )); then
-      bootid="$(command python3 "$lib" warp-epoch 2>/dev/null)"
+      bootid="$(command python3 "$lib" warp-epoch --from-parent 2>/dev/null)"
       [[ -n "$bootid" ]] || bootid="$(command python3 "$lib" bootid 2>/dev/null)"
     else
       bootid="$(command python3 "$lib" bootid 2>/dev/null)"
@@ -328,11 +328,28 @@ if [[ -o interactive ]] \
     # Order matters: pane lock FIRST, then the conversation claim. Reversed, a pane that loses
     # the pane-lock race would leak a conversation claim and block the pane that should win.
     if [[ -n "$sid" ]]; then
-      if [[ "$(command python3 "$lib" conversation-live "$sid" 2>/dev/null)" == 1 ]]; then
+      local _live_state="$(command python3 "$lib" conversation-live "$sid" 2>/dev/null)"
+      if [[ "$_live_state" == 1 ]]; then
         print -r -- "$(command date '+%F %T') STAND-DOWN term=$termid sid=$sid reason=already-running-elsewhere" >> "$log" 2>/dev/null
         _pane_resume_explain "is already open in another tab — this one stays empty" "$sid"
         export _SUPERSET_RESUME_DONE=1
         return 0
+      elif [[ "$_live_state" == 2 ]]; then
+        # A HIDDEN copy is mid-work on this conversation (no window, transcript active).
+        # Stand down now and the tab is empty forever — the exact 2026-10-11 symptom.
+        # Wait (bounded) for it to go idle, then resume HERE; the other copy has no
+        # window, so a second copy cannot happen and a reopen line is safe to print.
+        print -r -- "$(command date '+%F %T') WAIT-HIDDEN term=$termid sid=$sid reason=windowless-copy-still-working" >> "$log" 2>/dev/null
+        print -Pn "%F{yellow}▸%f "
+        print -r -- "resuming here — waiting for a background copy of this conversation to finish…"
+        if [[ "$(command python3 "$lib" wait-idle "$sid" --secs=30 --max=120 2>/dev/null)" == idle ]]; then
+          :   # fall through: this pane resumes below
+        else
+          _pane_resume_explain "still has a hidden copy working in the background" "$sid"
+          print -r -- "  reopen it here when it goes quiet: cc all --resume $sid"
+          export _SUPERSET_RESUME_DONE=1
+          return 0
+        fi
       fi
       # `== 0`, not `!= 1`. The library prints 0 ONLY when another pane already holds this
       # conversation; every other outcome — including no output at all because python3 died

@@ -66,6 +66,17 @@ ck "parent is not a Warp terminal-server (tmux etc) -> launches" \
    "$(ws warp-x a7 PANE_RESUME_TEST_SHELL_PPID=999 PANE_RESUME_TEST_TS_CMD='tmux: server' PANE_RESUME_TEST_LIVE_PIDS='')" "0"
 ck "boot-id fallback epoch is never sent (hook) -> no check, launches" \
    "$(ws '' a4 PANE_RESUME_TEST_SHELL_PPID=1)" "0"
+# Reviewer round-3 finding 2: the REAL liveness lines (kill -0 / ps -p on the app pid)
+# never ran under test — every case overrode them. Run both directions with NO overrides.
+REAL_TS_PID=$(ps -Ao pid=,command= | grep "Warp.app/Contents/MacOS/stable terminal-server" | grep -v grep | head -1 | awk '{print $1}')
+if [[ -n "$REAL_TS_PID" ]]; then
+  r=$(freeslot; PANE_RESUME_TEST_SHELL_PPID=$REAL_TS_PID bash "$SR" wait-slot --epoch warp-x a9 </dev/null >/dev/null 2>&1; echo $?)
+  ck "no-override: real live terminal-server parent -> launches (0)" "$r" "0"
+else
+  print "  skip (no terminal-server running here)"
+fi
+r=$(freeslot; PANE_RESUME_TEST_SHELL_PPID=999 PANE_RESUME_TEST_TS_CMD="/Applications/Warp.app/Contents/MacOS/stable terminal-server --parent-pid=999999" bash "$SR" wait-slot --epoch warp-x a10 </dev/null >/dev/null 2>&1; echo $?)
+ck "no-override: app pid gone -> refused (3)" "$r" "3"
 grep -q "WINDOW-GONE a2 -> launch refused" "$TMP/.superset-recovery/resume.log" \
   && ck "refusal logged with its label" "yes" "yes" || ck "refusal logged with its label" "no" "yes"
 r=$(freeslot; PANE_RESUME_TEST_SHELL_PPID=1 bash "$SR" wait-slot --epoch warp-x a8 </dev/null 2>&1 >/dev/null)
@@ -92,7 +103,7 @@ grep -q "IGNORED-WINDOWLESS pid=$ORPH sid=$SID" "$TMP/.superset-recovery/resume.
   && ck "ignored copy is logged" "yes" "yes" || ck "ignored copy is logged" "no" "yes"
 # N2: the same orphan, but its transcript was JUST written -> it is busy -> stand down
 print '{}' > "$TMP/.claude/projects/-tmp/$SID.jsonl"
-ck "windowless but BUSY (written <30s ago) -> stands down (1)" "$(python3 "$LIB" conversation-live $SID)" "1"
+ck "windowless but BUSY (written <30s ago) -> state 2 (wait, not stand-down)" "$(python3 "$LIB" conversation-live $SID)" "2"
 touch -t 202001010000 "$TMP/.claude/projects/-tmp/$SID.jsonl"
 ck "windowless and idle -> tab restores (0)" "$(python3 "$LIB" conversation-live $SID)" "0"
 kill $ORPH 2>/dev/null
@@ -118,6 +129,8 @@ ck "names the conversation, escapes NOT expanded" "$(print -r -- $out | grep -c 
 ck "says why the tab is empty"                    "$(print -r -- $out | grep -c 'already open in another tab')" "1"
 ck "offers NO reopen line (would duplicate)"      "$(print -r -- $out | grep -c 'cc all --resume')" "0"
 ck "both stand-down paths call it"                "$(grep -c '_pane_resume_explain "is' "$HOOK")" "2"
+ck "hook has the wait-for-hidden branch"      "$(grep -c 'WAIT-HIDDEN' "$HOOK")" "1"
+ck "wait branch's reopen line is inside it"   "$(sed -n '/WAIT-HIDDEN/,/esac\|^      fi/p' "$HOOK" | grep -c 'cc all --resume')" "1"
 
 # ---------------------------------------------------------------------------------------
 print "mutants -- would the checks above catch each broken version?"

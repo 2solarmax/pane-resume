@@ -473,7 +473,7 @@ def conversation_live(sid):
     Reads only how each process was started, and extracts only the conversation id — never
     anything else from the process table, which on this machine can carry secrets."""
     if not UUID_RE.match(sid or ""):
-        return False
+        return 0
     # Ignore agents that predate the current terminal run. Warp reuses pane uuids across a
     # restart, so during the ~19 seconds the previous run's agents take to exit, each one is
     # still running `--resume <the very sid this pane is about to resume>`. Without this,
@@ -499,7 +499,7 @@ def conversation_live(sid):
         ps = subprocess.run(["ps", "-Ao", fmt],
                             capture_output=True, text=True, timeout=15).stdout
     except Exception:
-        return False          # cannot tell -> do NOT block a restore
+        return 0          # cannot tell -> do NOT block a restore
     want = sid.lower()
     for line in ps.splitlines():
         if cutoff:
@@ -531,18 +531,18 @@ def conversation_live(sid):
             # launchd), stood down, and stayed empty — the conversation was alive yet nobody
             # could see or type into it. Only a copy you can actually reach blocks this tab.
             if _has_window(int(head[0]), sid):
-                return True
+                return 1
             # N2: a windowless copy that is still WORKING would become a second writer if we
             # restore over it. Its transcript changing in the last 30s is the sign it is busy;
             # then this tab stands down (with its explanation) rather than racing it.
             if _transcript_recent(sid, 30):
                 try:
                     with open(os.path.join(RECOV, "resume.log"), "a") as fh:
-                        fh.write("%s warp: WINDOWLESS-BUT-BUSY pid=%s sid=%s (standing down)\n"
+                        fh.write("%s warp: WINDOWLESS-BUT-BUSY pid=%s sid=%s (will wait for it to go idle)\n"
                                  % (time.strftime("%F %T"), head[0], sid))
                 except Exception:
                     pass
-                return True
+                return 2          # caller must WAIT for it, not stand down
             # Ignored on purpose — log it, so a hidden second writer is never silent.
             try:
                 with open(os.path.join(RECOV, "resume.log"), "a") as fh:
@@ -550,7 +550,7 @@ def conversation_live(sid):
                              % (time.strftime("%F %T"), head[0], sid))
             except Exception:
                 pass
-    return False
+    return 0
 
 
 def _transcript_recent(sid, secs):
@@ -797,7 +797,16 @@ def agent_running(term_id):
 # in a shared dir onto one session). Pane identity = WARP_TERMINAL_SESSION_UUID, which Warp
 # persists in terminal_panes and reuses on restore.
 
-def warp_epoch():
+def warp_epoch(from_pid=None):
+    """Identity of the CURRENT Warp run: its main process start time.
+
+    With from_pid: the run owning THAT process's pane — walk parents to the
+    `terminal-server --parent-pid=<app>` and use THAT app. During a relaunch overlap two
+    Warp apps coexist and lowest-pid picks the dying one, giving healthy new-run panes a
+    dead epoch (reviewer round-3 finding 3): their one-shot lock then collides with the
+    dead run's and the pane silently skips. The pane's own ancestry is always right.
+    Falls back to the lowest-pid pick when the walk finds nothing.
+    """
     """Identity of the CURRENT Warp run: its main process start time.
 
     Resume must fire ONCE PER WARP LAUNCH per pane — not once per shell. Keying the
@@ -807,6 +816,25 @@ def warp_epoch():
     restores, while inside one run a pane resumes at most once, so a quit stays quit.
     Empty string if Warp isn't found (caller then falls back to the boot id)."""
     try:
+        if from_pid:
+            p = from_pid
+            for _ in range(6):
+                out = subprocess.run(["ps", "-o", "ppid=,command=", "-p", str(p)],
+                                     capture_output=True, text=True, timeout=5).stdout.strip()
+                if not out:
+                    break
+                parts = out.split(None, 1)
+                if len(parts) < 2:
+                    break
+                ppid, cmd = int(parts[0]), parts[1]
+                m = re.search(r"--parent-pid=(\d+)", cmd)
+                if m:
+                    app = subprocess.run(["ps", "-o", "pid=,lstart=", "-p", m.group(1)],
+                                         capture_output=True, text=True, timeout=5).stdout.strip()
+                    if app:
+                        ap, al = app.split(None, 1)
+                        return "warp-%s-%s" % (ap, re.sub(r"[^0-9A-Za-z]", "", al))
+                p = ppid
         out = subprocess.run(["ps", "-Ao", "pid=,lstart=,command="],
                              capture_output=True, text=True, timeout=15).stdout
         # Warp runs more than one process from that path — the app itself and a
@@ -1091,7 +1119,10 @@ if __name__ == "__main__":
     elif cmd == "bootid":
         print(boot_id())
     elif cmd == "warp-epoch":
-        print(warp_epoch())
+        fp = None
+        if len(sys.argv) >= 4 and sys.argv[3] == "--from-parent":
+            fp = os.getppid()
+        print(warp_epoch(from_pid=fp))
     elif cmd == "label" and len(sys.argv) >= 3:
         print(_label(sys.argv[2]))
     elif cmd == "pane-label" and len(sys.argv) >= 3:
@@ -1144,8 +1175,25 @@ if __name__ == "__main__":
         print("1" if agent_descendant(sys.argv[2]) else "0")
     elif cmd == "agent-running" and len(sys.argv) >= 3:
         print("1" if agent_running(sys.argv[2]) else "0")
+    elif cmd == "wait-idle" and len(sys.argv) >= 4:
+        # Wait until the conversation's transcript has been quiet for `secs` (or the busy
+        # hidden copy is gone). Prints "idle" / "still-busy"; bounded by --max <s>.
+        sid, secs = sys.argv[2], 30
+        maxs = 120
+        for a in sys.argv[3:]:
+            if a.startswith("--secs="): secs = int(a.split("=", 1)[1] or 30)
+            if a.startswith("--max="): maxs = int(a.split("=", 1)[1] or 120)
+        import time as _t
+        deadline = _t.time() + maxs
+        while _t.time() < deadline:
+            if not _transcript_recent(sid, secs) or not conversation_live(sid):
+                print("idle"); break
+            _t.sleep(1)
+        else:
+            print("still-busy")
     elif cmd == "conversation-live" and len(sys.argv) >= 3:
-        print("1" if conversation_live(sys.argv[2]) else "0")
+        r = conversation_live(sys.argv[2])
+        print(r if r in (0, 1) else r)
     elif cmd == "launch-plan" and len(sys.argv) >= 4:
         print(launch_plan(sys.argv[2], sys.argv[3]))
     elif cmd == "guard" and len(sys.argv) >= 3:
