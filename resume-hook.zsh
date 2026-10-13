@@ -444,9 +444,12 @@ if [[ -o interactive ]] \
           # fine because their sessions lived in the pane's own cwd). Keep the parens in
           # a separate variable the join never touches; only the PATH and the command
           # words go through (q).
-          typeset -g _PANE_RESUME_PREFIX="( "
           typeset -g _PANE_RESUME_SUFFIX=" )"
-          base=( cd -- "${(q)_plan_parts[2]}" "&&" "${(@)base}" )
+          # The `&&` is structural too — it must NOT pass through the (q) join below, or it
+          # becomes a literal `\&\&` argument to cd ("cd: too many arguments", 2026-10-13;
+          # the 2026-09-12 fix kept the parens out of the join but missed this operator).
+          # The cd half is pre-quoted into the prefix; only the resume command words are joined.
+          typeset -g _PANE_RESUME_PREFIX="( cd -- ${(q)_plan_parts[2]} && "
           print -r -- "$(command date '+%F %T')   -> launching from ${_plan_parts[2]}" >> "$log" 2>/dev/null
         fi
         ;;

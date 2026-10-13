@@ -16,7 +16,7 @@ Commands:
   plan                                  -> human table of what WOULD resume (dry-run)
   bootid                                -> stable id of the current boot ("" if unknown)
 """
-import sys, os, glob, sqlite3, subprocess, re, time, json
+import sys, os, json, glob, sqlite3, subprocess, re, time, json
 
 # What to CALL a conversation — one rule, every surface. Imported DEFENSIVELY: the resume
 # hook calls this file for every pane, so a missing titlelib must cost a pane's title, never
@@ -501,6 +501,19 @@ def conversation_live(sid):
     except Exception:
         return 0          # cannot tell -> do NOT block a restore
     want = sid.lower()
+    # Registry pass first: sessions started WITHOUT --resume carry their id only here.
+    reg_pids = set()
+    try:
+        for f in glob.glob(os.path.join(HOME, ".claude", "sessions", "*.json")):
+            try:
+                with open(f) as fh:
+                    j = json.load(fh)
+            except Exception:
+                continue
+            if (j.get("sessionId") or "").lower() == want and j.get("pid"):
+                reg_pids.add(str(j["pid"]))
+    except Exception:
+        reg_pids = set()
     for line in ps.splitlines():
         if cutoff:
             m = re.match(r"\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4})\s+(.*)", line)
@@ -525,7 +538,7 @@ def conversation_live(sid):
         if os.path.basename(cmd.split(" ", 1)[0]) != "claude":
             continue
         m = re.search(r"--resume\s+([0-9a-fA-F-]{36})", cmd)
-        if m and m.group(1).lower() == want:
+        if (m and m.group(1).lower() == want) or head[0] in reg_pids:
             # A copy with NO WINDOW does not count as "running". 2026-10-11: 21 tabs saw an
             # invisible copy (its Warp window had relaunched away, shell re-parented to
             # launchd), stood down, and stayed empty — the conversation was alive yet nobody

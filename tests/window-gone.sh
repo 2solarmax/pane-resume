@@ -132,6 +132,30 @@ ck "both stand-down paths call it"                "$(grep -c '_pane_resume_expla
 ck "hook has the wait-for-hidden branch"      "$(grep -c 'WAIT-HIDDEN' "$HOOK")" "1"
 ck "wait branch's reopen line is inside it"   "$(sed -n '/WAIT-HIDDEN/,/esac\|^      fi/p' "$HOOK" | grep -c 'cc all --resume')" "1"
 
+print "D. the CD-wrapped line actually runs (2026-10-13: && was quote-escaped -> cd error)"
+D="$TMP/dir with space"; mkdir -p "$D"
+base=( echo CDLINE-OK )
+# take the prefix construction VERBATIM from the shipped hook (not a re-typed copy)
+pfx_line=$(grep -m1 '_PANE_RESUME_PREFIX="( cd -- ' "$HOOK" | sed 's/^ *typeset -g //')
+[[ -n "$pfx_line" ]] || { print "  FAIL hook prefix line not found"; fail=$((fail+1)); }
+_plan_parts=( CD "$D" ); eval "$pfx_line"; _PANE_RESUME_SUFFIX=" ; pwd )"
+line="${_PANE_RESUME_PREFIX}${(j: :)${(q)base[@]}}${_PANE_RESUME_SUFFIX}"
+out=$(zsh -c "D=${(qq)D}; eval ${(qq)line}" 2>&1)
+ck "built line executes in the target dir" "$out" "CDLINE-OK
+$D"
+ck "no backslash-escaped && in the built line" "$(print -r -- $line | grep -c '\\\&\\\&')" "0"
+
+# E: a HAND-STARTED session (registry, no --resume) must count as live (2026-10-13 a36e02ad)
+SIDH=44444444-5555-6666-7777-888888888888
+( perl -e '$0="claude"; sleep 60' & echo $! > "$TMP/fakepid" ); sleep 0.3
+FAKEH=$(cat "$TMP/fakepid"); FAKES+=($FAKEH)
+mkdir -p "$TMP/.claude/sessions"
+printf '{"sessionId":"%s","pid":%s}' "$SIDH" "$FAKEH" > "$TMP/.claude/sessions/$FAKEH.json"
+ck "hand-started live session -> stands down (1)" "$(python3 "$LIB" conversation-live $SIDH)" "1"
+kill $FAKEH 2>/dev/null
+printf '{"sessionId":"%s","pid":%s}' "$SIDH" 999999 > "$TMP/.claude/sessions/$FAKEH.json"
+ck "registry entry with dead pid -> not live (0)" "$(python3 "$LIB" conversation-live $SIDH)" "0"
+
 # ---------------------------------------------------------------------------------------
 print "mutants -- would the checks above catch each broken version?"
 M="$TMP/mut"; mkdir -p $M
@@ -148,6 +172,12 @@ mutant "$SR" $M/sr2 '        if _refuse_if_window_gone; then _drain_tty; exit 3;
 freeslot; mkdir -p "$TMP/.superset-recovery/starting/0"
 r=$(PANE_RESUME_TEST_SHELL_PPID=1 PANE_RESUME_TEST_BUDGET=0 bash $M/sr2 wait-slot --epoch warp-x m2 </dev/null >/dev/null 2>&1; echo $?); freeslot
 ck "M2 give-up path unchecked -> A catches it (launches)" "$r" "0"
+python3 "${LIB:h}/tests/mutate.py" "$HOOK" $M/hook6 '"( cd -- ${(q)_plan_parts[2]} && "' '"( cd -- ${(q)_plan_parts[2]} \\&\\& "' >/dev/null || { print "  FAIL M6 did not apply"; fail=$((fail+1)); }
+pfx6=$(grep -m1 '_PANE_RESUME_PREFIX="( cd -- ' $M/hook6 | sed 's/^ *typeset -g //')
+_plan_parts=( CD "$D" ); eval "$pfx6"
+line6="${_PANE_RESUME_PREFIX}${(j: :)${(q)base[@]}}${_PANE_RESUME_SUFFIX}"
+out6=$(zsh -c "eval ${(qq)line6}" 2>&1)
+ck "M6 escaped && restored -> D catches it (cd error)" "$(print -r -- $out6 | grep -c 'too many arguments')" "1"
 mutant "$LIB" $M/lib3.py '            if ppid == 1:
                 return False' '            if ppid == 1:
                 return True'
