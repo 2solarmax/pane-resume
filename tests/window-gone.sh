@@ -156,6 +156,38 @@ kill $FAKEH 2>/dev/null
 printf '{"sessionId":"%s","pid":%s}' "$SIDH" 999999 > "$TMP/.claude/sessions/$FAKEH.json"
 ck "registry entry with dead pid -> not live (0)" "$(python3 "$LIB" conversation-live $SIDH)" "0"
 
+# F: a STRAY shell Warp hands to a new tab still carries an OLD tab's pane id (2026-10-14
+# 12:00, 2026-10-13 14:17). If that pane's own shell is alive, the stray must do nothing.
+print "F. a stray shell carrying another live tab's pane id stays silent"
+PU=ccddeeff00112233445566778899aabb
+mkdir -p "$TMP/.superset-recovery/warp-shell"
+zsh -c 'sleep 60; :' & OWN=$!; FAKES+=($OWN); sleep 0.3
+print -r -- "$OWN	trap1" > "$TMP/.superset-recovery/warp-shell/$PU"
+ck "live owner shell of this run -> stray (1)"   "$(python3 "$LIB" pane-owned-elsewhere $PU $$)" "1"
+ck "asking as the owner itself -> not stray (0)" "$(python3 "$LIB" pane-owned-elsewhere $PU $OWN)" "0"
+touch -t 202001010000 "$TMP/.superset-recovery/warp-shell/$PU"
+ck "owner younger than its record (reused pid) -> 0" "$(python3 "$LIB" pane-owned-elsewhere $PU $$)" "0"
+touch "$TMP/.superset-recovery/warp-shell/$PU"
+perl -e '$0="notashell"; sleep 60' & NS=$!; FAKES+=($NS); sleep 0.3
+print -r -- "$NS	trap1" > "$TMP/.superset-recovery/warp-shell/$PU"
+ck "registered pid is not a shell (reused) -> 0" "$(python3 "$LIB" pane-owned-elsewhere $PU $$)" "0"
+kill $NS 2>/dev/null; wait $NS 2>/dev/null
+print -r -- "$NS	trap1" > "$TMP/.superset-recovery/warp-shell/$PU"
+ck "registered owner dead -> 0"                 "$(python3 "$LIB" pane-owned-elsewhere $PU $$)" "0"
+ck "no registration at all -> unknown (-1)"     "$(python3 "$LIB" pane-owned-elsewhere aaaa0000aaaa0000aaaa0000aaaa0000 $$)" "-1"
+# the shipped hook, run as a real interactive shell under the stray's pane id
+print -r -- "$OWN	trap1" > "$TMP/.superset-recovery/warp-shell/$PU"
+mkdir -p "$TMP/.superset-recovery/warp-last"; print "/tmp\t$SID2" > "$TMP/.superset-recovery/warp-last/$PU"
+hookrun() { env -i HOME="$TMP" PATH="$PATH" TERM_PROGRAM=WarpTerminal WARP_TERMINAL_SESSION_UUID=$PU \
+  zsh -f -i -c "source ${(qq)1}" 2>&1 </dev/null; }
+out=$(hookrun "$HOOK")
+ck "stray shell: no tab title printed"           "$(print -r -- $out | grep -c 'outreach')" "0"
+ck "stray shell: owner's registration kept"      "$(cut -f1 "$TMP/.superset-recovery/warp-shell/$PU")" "$OWN"
+ck "stray shell: logged why it stayed silent"    "$(grep -c "pid=.* reason=stray-shell-pane-already-owned" "$TMP/.superset-recovery/resume.log")" "1"
+kill $OWN 2>/dev/null; wait $OWN 2>/dev/null
+out=$(hookrun "$HOOK")
+ck "owner gone: same pane titles itself normally" "$(print -r -- $out | grep -c 'outreach')" "1"
+
 # ---------------------------------------------------------------------------------------
 print "mutants -- would the checks above catch each broken version?"
 M="$TMP/mut"; mkdir -p $M
@@ -192,6 +224,24 @@ mutant "$LIB" $M/lib4.py '        elif not _sid_has_warp_record(sid):
 O4=$(pgrep -f "claude --resume $SIDNW"); FAKES+=($O4)
 ck "M4 record guard inverted -> B catches it (0)" "$(python3 $M/lib4.py conversation-live $SIDNW)" "0"
 kill $O4 2>/dev/null
+
+cp "$LIB" $M/resume-lib.py
+python3 "${LIB:h}/tests/mutate.py" "$LIB" $M/lib7.py '        if not mine or mine != theirs:
+            return 0
+    except Exception:
+        return -1
+    return 1' '        if not mine or mine != theirs:
+            return 0
+    except Exception:
+        return -1
+    return 0' >/dev/null || { print "  FAIL M7 did not apply"; fail=$((fail+1)); }
+zsh -c 'sleep 60; :' & O7=$!; FAKES+=($O7); sleep 0.3
+print -r -- "$O7	trap1" > "$TMP/.superset-recovery/warp-shell/$PU"
+ck "M7 owner never detected -> F catches it (0)" "$(python3 $M/lib7.py pane-owned-elsewhere $PU $$)" "0"
+python3 "${LIB:h}/tests/mutate.py" "$HOOK" $M/hook8 '  (( _pane_resume_stray_shell )) || () {' '  () {' >/dev/null || { print "  FAIL M8 did not apply"; fail=$((fail+1)); }
+out8=$(hookrun $M/hook8)
+ck "M8 hook ignores stray flag -> F catches it (title printed)" "$(print -r -- $out8 | grep -c 'outreach')" "1"
+kill $O7 2>/dev/null
 
 print "result: $pass passed, $fail failed"
 [[ $fail -eq 0 ]] || exit 1

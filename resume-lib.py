@@ -920,6 +920,68 @@ def _wlog(msg):
 
 
 
+def pane_owned_elsewhere(uuid, myself):
+    """Is another LIVE shell already registered for this pane? 0=no / 1=yes / -1=unknown.
+
+    Warp pre-warms shells and hands them to new tabs; when its terminal-server hiccups it
+    attaches a STALE one — created for an old tab, still carrying that tab's pane id, and
+    dormant for minutes (2026-10-14 12:00: the Nikita pane's spare from 10:13 was handed to
+    a brand-new tab 107 minutes later; the identical signature at 2026-10-13 14:17). That
+    impostor shell runs this hook under the old pane's id and announces the old pane's
+    conversation into a tab that has nothing to do with it.
+
+    The pane's own registered shell (warp-shell/<uuid>, written by the live shell at
+    startup) is the discriminator: a pane can have exactly one. If the registered owner is
+    ALIVE and is not us, this shell is a stray -> the caller steps aside SILENTLY (the
+    real owner's tab already shows the conversation; a message in a random new tab is the
+    confusion this prevents). A dead or missing registration is inconclusive -> -1 (caller
+    proceeds; a normal restored pane usually has no live registration yet, and refusing
+    there would skip legitimate restores — the 2026-08-23 failure).
+
+    Never signals, never kills: the other shell is a live Warp pane. Read-only checks."""
+    try:
+        with open(os.path.join(RECOV, "warp-shell", uuid)) as fh:
+            parts = fh.read().split()
+        owner = int(parts[0]) if parts else 0
+        myself = int(myself)
+    except Exception:
+        return -1
+    if owner <= 0 or owner == myself:
+        return 0
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(owner)],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return -1
+    if not out:
+        return 0                                # registration is stale; nobody owns the pane
+    # Three checks before a live pid counts as the pane's owner. Each one closes a way a
+    # healthy restored pane could be wrongly silenced (the costly direction):
+    #  1. it is a shell — a pid from before a reboot can be reused by anything;
+    #  2. it started BEFORE the registration was written — the owner wrote that file, so a
+    #     process younger than the file is a reused pid, not the writer;
+    #  3. it belongs to the SAME Warp run as us — during a relaunch the previous run's
+    #     shells live on for a few seconds with the very pane ids being restored
+    #     (2026-08-23: 22 of 56 panes skipped on exactly that overlap).
+    try:
+        info = subprocess.run(["ps", "-o", "lstart=,comm=", "-p", str(owner)],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+        m = re.match(r"(\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4})\s+(.*)", info)
+        if not m:
+            return -1
+        if os.path.basename(m.group(2).strip()).lstrip("-") not in ("zsh", "bash", "sh"):
+            return 0
+        started = time.mktime(time.strptime(m.group(1), "%a %b %d %H:%M:%S %Y"))
+        if started > os.path.getmtime(os.path.join(RECOV, "warp-shell", uuid)) + 1:
+            return 0
+        mine, theirs = warp_epoch(from_pid=myself), warp_epoch(from_pid=owner)
+        if not mine or mine != theirs:
+            return 0
+    except Exception:
+        return -1
+    return 1
+
+
 def _history_resume(uuid, sid, need_dir):
     """Newest other history entry for this pane that is still resumable — transcript on
     disk, and (need_dir) its own folder still present. Newest first; returns sid or None."""
@@ -1188,6 +1250,8 @@ if __name__ == "__main__":
         print("1" if agent_descendant(sys.argv[2]) else "0")
     elif cmd == "agent-running" and len(sys.argv) >= 3:
         print("1" if agent_running(sys.argv[2]) else "0")
+    elif cmd == "pane-owned-elsewhere" and len(sys.argv) >= 4:
+        print(pane_owned_elsewhere(sys.argv[2], sys.argv[3]))
     elif cmd == "wait-idle" and len(sys.argv) >= 4:
         # Wait until the conversation's transcript has been quiet for `secs` (or the busy
         # hidden copy is gone). Prints "idle" / "still-busy"; bounded by --max <s>.

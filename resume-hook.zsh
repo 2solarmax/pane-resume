@@ -34,7 +34,22 @@ if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \
    && [[ -z "$_SUPERSET_RESUME_DONE" ]] \
    && [[ "$TERM_PROGRAM" == "WarpTerminal" ]] \
    && [[ "$WARP_TERMINAL_SESSION_UUID" =~ '^[0-9a-fA-F]{32}$' ]]; then
-  () {
+  # ONE owner per pane. Warp pre-warms shells and hands one to each new tab; when its
+  # terminal-server hiccups it attaches a STALE pre-warmed one that still carries an OLD
+  # tab's pane id (2026-10-13 14:17 and 2026-10-14 12:00, proven from Warp's own log: the
+  # "new tab" shell was created 40-170 minutes before the tab, stamped with the previous
+  # pane's uuid). Such a shell would title the new tab after the old tab's conversation
+  # and announce that conversation as "already open in another tab". If a LIVE shell of
+  # this Warp run is already registered for this pane and it is not us, this shell does
+  # nothing for the pane — no title, no registration, no resume, no message. The real
+  # owner's tab already shows the conversation.
+  integer -g _pane_resume_stray_shell=0
+  if [[ "$(command python3 "$HOME/.superset-recovery/resume-lib.py" \
+            pane-owned-elsewhere "$WARP_TERMINAL_SESSION_UUID" "$$" 2>/dev/null)" == 1 ]]; then
+    _pane_resume_stray_shell=1
+    print -r -- "$(command date '+%F %T') SKIP term=$WARP_TERMINAL_SESSION_UUID pid=$$ reason=stray-shell-pane-already-owned" >> "$HOME/.superset-recovery/resume.log" 2>/dev/null
+  fi
+  (( _pane_resume_stray_shell )) || () {
     emulate -L zsh
     local lbl
     lbl="$(command python3 "$HOME/.superset-recovery/resume-lib.py" pane-label "$WARP_TERMINAL_SESSION_UUID" 2>/dev/null)"
@@ -141,7 +156,11 @@ if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \
   # the same block as the trap and names the trap's contract, so an older shell from
   # before this feature (no marker) or a future incompatible one is never signalled.
   command mkdir -p "$HOME/.superset-recovery/warp-shell" 2>/dev/null
-  print -r -- "$$	trap1" > "$HOME/.superset-recovery/warp-shell/$WARP_TERMINAL_SESSION_UUID" 2>/dev/null
+  # A stray shell (see the pane-label block) must not take over the pane's registration:
+  # the real owner's restore-in-place depends on it.
+  if (( ! _pane_resume_stray_shell )); then
+    print -r -- "$$	trap1" > "$HOME/.superset-recovery/warp-shell/$WARP_TERMINAL_SESSION_UUID" 2>/dev/null
+  fi
   TRAPUSR1() {
     emulate -L zsh
     local recov="$HOME/.superset-recovery" req cmd mtime now
@@ -225,6 +244,12 @@ if [[ -o interactive ]] \
       plan="$(command python3 "$lib" resolve "$termid" "$wsid" 2>/dev/null)" || return 0
     elif [[ "$TERM_PROGRAM" == "WarpTerminal" && "$WARP_TERMINAL_SESSION_UUID" =~ '^[0-9a-fA-F]{32}$' ]]; then
       is_warp=1; termid="$WARP_TERMINAL_SESSION_UUID"
+      # A stray pre-warmed shell (see the warp-shell block above) must not resume, explain,
+      # or otherwise act for a pane whose real shell is alive in another tab. It burned
+      # its claimed-lock's one-shot on 2026-10-13/14 and printed confusion into fresh tabs.
+      if (( _pane_resume_stray_shell )); then
+        return 0
+      fi
       plan="$(command python3 "$lib" resolve-warp "$termid" 2>/dev/null)" || return 0
     else
       return 0
