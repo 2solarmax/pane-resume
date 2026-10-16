@@ -15,10 +15,59 @@ No-op everywhere except a Warp pane. Fast, dependency-free, never raises (a hook
 errors must not disrupt the session). Skips sub-agent / forked sessions (not the pane's
 primary conversation).
 """
-import sys, os, json, re
+import sys, os, json, re, subprocess, time
 
 WARP_UUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+
+
+def _ancestor_pids(start):
+    """Inclusive pid ancestry of `start` via ps ppid-walk; best-effort, capped."""
+    pids, cur, hops = [], start, 0
+    while hops < 64:
+        hops += 1
+        try:
+            out = subprocess.run(["ps", "-o", "ppid=", "-p", str(cur)],
+                                 capture_output=True, text=True).stdout.strip()
+        except Exception:
+            break
+        if not out.isdigit():
+            break
+        nxt = int(out)
+        pids.append(cur)
+        if nxt <= 1 or nxt == cur:
+            break
+        cur = nxt
+    return pids
+
+
+def _stale_env_uuid(uuid, recov):
+    """True when warp-shell/<uuid> names a live, plausible owner shell that is NOT an
+    ancestor of this process — i.e. the env pane id is stale: claude is running inside a
+    stray pre-warmed shell stamped with another pane's id (2026-10-11..14), and letting
+    SessionStart write would overwrite the REAL pane's record with a conversation that
+    never ran there (observed: warp-bindings/82db646d… held honestwriter content)."""
+    try:
+        with open(os.path.join(recov, "warp-shell", uuid)) as fh:
+            owner = int(fh.read().split("\t")[0])
+    except Exception:
+        return False
+    if owner <= 1 or owner == os.getpid():
+        return False
+    try:
+        info = subprocess.run(["ps", "-o", "lstart=,comm=", "-p", str(owner)],
+                              capture_output=True, text=True).stdout.strip()
+        m = re.match(r"(\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4})\s+(.*)", info)
+        if not m:
+            return False                                   # unreadable -> don't judge
+        if os.path.basename(m.group(2).strip()).lstrip("-") not in ("zsh", "bash", "sh"):
+            return False                                   # pid reused by a non-shell
+        started = time.mktime(time.strptime(m.group(1), "%a %b %d %H:%M:%S %Y"))
+        if started > os.path.getmtime(os.path.join(recov, "warp-shell", uuid)) + 1:
+            return False                                   # pid reused after a reboot
+    except Exception:
+        return False
+    return owner not in _ancestor_pids(os.getpid())
 
 
 def main():
@@ -49,6 +98,16 @@ def main():
         sid = data.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
         cwd = data.get("cwd") or os.getcwd()
         if not UUID_RE.match(sid or ""):
+            return
+        # A session started under a STALE pane id must not overwrite the pane's real
+        # record — the registered owner shell is alive but is not this session's shell.
+        if _stale_env_uuid(uuid, os.path.dirname(bdir)):
+            try:
+                with open(os.path.join(os.path.dirname(bdir), "resume.log"), "a") as fh:
+                    fh.write("%s warp: SessionStart pane=%s sid=%s — stale uuid, pane owned by another live shell; write suppressed\n"
+                             % (time.strftime("%F %T"), uuid[:8], sid[:8]))
+            except OSError:
+                pass
             return
         rec = "%s\t%s\n" % (cwd, sid)
         for path in (bpath, lpath):
