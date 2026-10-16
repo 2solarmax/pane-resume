@@ -109,6 +109,20 @@ def main():
             except OSError:
                 pass
             return
+        # Skip tool/print-mode sessions (`claude -p`, Bash-tool claude, SDK): they are
+        # not the pane's conversation, but their SessionStart inherited the pane uuid, so
+        # writing here evicts the pane's REAL binding — 2026-10-16: a morning deny-test
+        # claude spawned by the pane's own session overwrote the "automations monitor"
+        # tab's record; the restart then wiped the temp cwd and the tab restored to
+        # nothing while its real conversation sat resumable the whole time.
+        if os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "sdk-cli":
+            try:
+                with open(os.path.join(os.path.dirname(bdir), "resume.log"), "a") as fh:
+                    fh.write("%s warp: SessionStart pane=%s sid=%s — sdk-cli (tool/print) session; write skipped\n"
+                             % (time.strftime("%F %T"), uuid[:8], sid[:8]))
+            except OSError:
+                pass
+            return
         rec = "%s\t%s\n" % (cwd, sid)
         for path in (bpath, lpath):
             try:

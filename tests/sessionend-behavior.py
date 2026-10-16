@@ -91,6 +91,20 @@ with open(f"{tmp}/.superset-recovery/warp-shell/{PANE}","w") as f: f.write("9999
 fire_raw({"hook_event_name":"SessionStart","session_id":NEW_SID,"cwd":"/tmp"})
 ck("binding written (dead owner does not block)", rec("warp-bindings") == f"/tmp\t{NEW_SID}\n")
 
+print("7) sdk-cli (tool/print-mode) SessionStart must NOT write any record:")
+import shutil as _sh
+_sh.rmtree(f"{tmp}/.superset-recovery/warp-history", ignore_errors=True)
+seed_old()
+env7 = dict(os.environ, TERM_PROGRAM="WarpTerminal", WARP_TERMINAL_SESSION_UUID=PANE, CLAUDE_CODE_ENTRYPOINT="sdk-cli")
+subprocess.run([sys.executable, HOOK], input=json.dumps({"hook_event_name":"SessionStart","session_id":NEW_SID,"cwd":"/tmp"}), env=env7, capture_output=True, text=True)
+ck("binding untouched", rec("warp-bindings") == f"/tmp\t{OLD_SID}\n")
+ck("warp-last untouched", rec("warp-last") == f"/tmp\t{OLD_SID}\n")
+ck("history not polluted", NEW_SID not in open(f"{tmp}/.superset-recovery/warp-history/{PANE}").read() if os.path.exists(f"{tmp}/.superset-recovery/warp-history/{PANE}") else True)
+print("8) interactive (cli) SessionStart still writes:")
+seed_old()
+subprocess.run([sys.executable, HOOK], input=json.dumps({"hook_event_name":"SessionStart","session_id":NEW_SID,"cwd":"/tmp"}), env=dict(os.environ, TERM_PROGRAM="WarpTerminal", WARP_TERMINAL_SESSION_UUID=PANE, CLAUDE_CODE_ENTRYPOINT="cli"), capture_output=True, text=True)
+ck("binding written", rec("warp-bindings") == f"/tmp\t{NEW_SID}\n")
+
 print("M) mutant: stale-uuid guard disabled -> suppression must vanish:")
 M = tempfile.mkdtemp()
 mhook = f"{M}/warp-session-hook.py"
