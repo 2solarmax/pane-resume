@@ -50,6 +50,27 @@ ws() {  # ws <epoch-or-empty> <label> [env...] -> exit code of wait-slot
   echo $?
 }
 
+# G. Leaked claude markers must not disable the hook in a REAL pane (2026-10-26: Warp
+#    relaunched from inside a claude session inherited CLAUDECODE=1 +
+#    CLAUDE_CODE_CHILD_SESSION=1; every tab shell carried them, the hook went silent in
+#    every pane, 0 of ~60 sessions restored, tab transcripts stopped saving). The parent
+#    decides: Warp binary parent -> pane (hook runs, markers scrubbed); anything else with
+#    CLAUDECODE -> probe (hook silent, exclusion unchanged).
+GU1=1111aaaa2222bbbb3333cccc4444dddd; GU2=1111aaaa2222bbbb3333cccc4444ddde
+FAKEW=$TMP/fakewarp/Warp.app/Contents/MacOS; mkdir -p $FAKEW
+cat > $FAKEW/wrapper.sh <<WEOF
+#!/bin/sh
+env -i HOME="$TMP" PATH="$PATH" TERM_PROGRAM=WarpTerminal WARP_TERMINAL_SESSION_UUID=$GU1 CLAUDECODE=1 CLAUDE_CODE_CHILD_SESSION=1 /bin/zsh -f -i -c 'source $HOOK; print MARKER=\${+CLAUDECODE} CHILD=\${+CLAUDE_CODE_CHILD_SESSION}' </dev/null 2>&1
+sleep 0.2
+WEOF
+chmod +x $FAKEW/wrapper.sh
+outg1=$(/bin/sh $FAKEW/wrapper.sh)
+ck "G1 leaked markers + Warp parent: hook ran (registered)" "$( [ -f $TMP/.superset-recovery/warp-shell/$GU1 ] && echo YES || echo NO )" "YES"
+ck "G1 markers scrubbed in the pane shell" "$outg1" "MARKER=0 CHILD=0"
+outg2=$(env -i HOME="$TMP" PATH="$PATH" TERM_PROGRAM=WarpTerminal WARP_TERMINAL_SESSION_UUID=$GU2 CLAUDECODE=1 CLAUDE_CODE_CHILD_SESSION=1 zsh -f -i -c "source ${(qq)HOOK}" 2>&1 </dev/null)
+ck "G2 probe shell (claude parent): stays silent" "$( [ -f $TMP/.superset-recovery/warp-shell/$GU2 ] && echo YES || echo NO )" "NO"
+ck "G2 probe shell: no title emitted" "$(print -r -- $outg2 | wc -l | tr -d ' ')" "0"
+
 # ---------------------------------------------------------------------------------------
 print "A. launch refused only when THIS tab's window is really gone (checked at wait end)"
 TS="/Applications/Warp.app/Contents/MacOS/stable terminal-server --parent-pid=80549"
@@ -240,6 +261,16 @@ print -r -- "$O7	trap1" > "$TMP/.superset-recovery/warp-shell/$PU"
 ck "M7 owner never detected -> F catches it (0)" "$(python3 $M/lib7.py pane-owned-elsewhere $PU $$)" "0"
 python3 "${LIB:h}/tests/mutate.py" "$HOOK" $M/hook8 '  (( _pane_resume_stray_shell )) || () {' '  () {' >/dev/null || { print "  FAIL M8 did not apply"; fail=$((fail+1)); }
 out8=$(hookrun $M/hook8)
+
+# M9: revert the parent-based probe gate to the old blanket CLAUDECODE check -> G1 must fail
+python3 "${LIB:h}/tests/mutate.py" "$HOOK" $M/hook9 'if [[ -o interactive ]] && (( ! _pane_resume_probe_shell )) \' 'if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \' >/dev/null || { print "  FAIL M9 did not apply"; fail=$((fail+1)); }
+cat > $TMP/fakewarp/wrapper9.sh <<W9
+#!/bin/sh
+env -i HOME="$TMP" PATH="$PATH" TERM_PROGRAM=WarpTerminal WARP_TERMINAL_SESSION_UUID=$GU1 CLAUDECODE=1 /bin/zsh -f -i -c 'source '$M'/hook9' </dev/null 2>&1
+W9
+rm -f $TMP/.superset-recovery/warp-shell/$GU1
+/bin/sh $TMP/fakewarp/wrapper9.sh >/dev/null 2>&1
+ck "M9 old gate kills pane registration (guard is load-bearing)" "$( [ -f $TMP/.superset-recovery/warp-shell/$GU1 ] && echo YES || echo NO )" "NO"
 ck "M8 hook ignores stray flag -> F catches it (title printed)" "$(print -r -- $out8 | grep -c 'outreach')" "1"
 kill $O7 2>/dev/null
 

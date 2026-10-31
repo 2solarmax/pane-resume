@@ -101,12 +101,39 @@ def main():
             return
         # A session started under a STALE pane id must not overwrite the pane's real
         # record — the registered owner shell is alive but is not this session's shell.
+        # But the session itself may be REAL and long-lived: 2026-10-29..31, the owner
+        # was a spare pre-warmed shell Warp had handed into pane 8e76fae8 (pid 22185),
+        # Max resumed "keeper" (96584429) into that pane by hand, the write was
+        # suppressed, and the conversation then ran 2 days recorded NOWHERE — after the
+        # 10-31 restart the pane restored an OLDER session instead. So: still append to
+        # the pane's HISTORY (append-only, never the single-slot live binding). The
+        # resolver's history fallback can then find it; a deliberately-quit session is
+        # pruned from history by SessionEnd as usual, so this cannot resurrect a quit.
         if _stale_env_uuid(uuid, os.path.dirname(bdir)):
             try:
                 with open(os.path.join(os.path.dirname(bdir), "resume.log"), "a") as fh:
-                    fh.write("%s warp: SessionStart pane=%s sid=%s — stale uuid, pane owned by another live shell; write suppressed\n"
+                    fh.write("%s warp: SessionStart pane=%s sid=%s — stale uuid, pane owned by another live shell; write suppressed (history kept)\n"
                              % (time.strftime("%F %T"), uuid[:8], sid[:8]))
             except OSError:
+                pass
+            try:
+                hpath = os.path.join(os.path.dirname(bdir), "warp-history", uuid)
+                os.makedirs(os.path.dirname(hpath), exist_ok=True)
+                prev = []
+                try:
+                    with open(hpath) as fh:
+                        prev = [ln.strip() for ln in fh if ln.strip()]
+                except OSError:
+                    pass
+                entry = "%s\t%s\t%d" % (cwd, sid, int(time.time()))
+                prev = [e for e in prev if e.split("\t")[1:2] != [sid]]
+                prev.insert(0, entry)
+                prev = prev[:10]
+                tmp = hpath + ".tmp"
+                with open(tmp, "w") as fh:
+                    fh.write("\n".join(prev) + "\n")
+                os.replace(tmp, hpath)
+            except Exception:
                 pass
             return
         # Skip tool/print-mode sessions (`claude -p`, Bash-tool claude, SDK): they are

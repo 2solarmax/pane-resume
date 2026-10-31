@@ -22,6 +22,23 @@
 # burned and can retry. The agent runs as a CHILD (never exec), so if it exits/fails the
 # pane falls back to a normal shell rather than dying.
 
+# CLAUDECODE marks shells a running claude spawned (probe shells, subagents) — they must
+# not register panes or resume. But a REAL Warp pane shell can carry the markers too:
+# 2026-10-26 Warp was relaunched from inside a claude session and inherited CLAUDECODE=1 +
+# CLAUDE_CODE_CHILD_SESSION=1 into its own environment, so EVERY tab shell it spawned had
+# them — this hook went silent in every pane (0 of ~60 sessions restored, tab transcripts
+# stopped saving). The PARENT decides: a shell whose parent is a Warp binary is a pane no
+# matter what markers it inherited; CLAUDECODE with any other parent is a probe. In a pane
+# the markers are scrubbed here, so claude launched in the tab saves transcripts normally.
+if [[ -n "$CLAUDECODE" ]] \
+   && [[ "$(command ps -o command= -p $PPID 2>/dev/null)" != *"/Warp.app/Contents/MacOS/"* ]]; then
+  integer -g _pane_resume_probe_shell=1
+else
+  integer -g _pane_resume_probe_shell=0
+  [[ -n "$CLAUDECODE" ]] && unset CLAUDECODE
+  [[ -n "$CLAUDE_CODE_CHILD_SESSION" ]] && unset CLAUDE_CODE_CHILD_SESSION
+fi
+
 # ── PANE LABEL (runs ALWAYS — even disarmed, even when nothing is resumed) ────────
 # Warp labels every pane with its working directory, which is identical across dozens of
 # panes and tells you nothing. After a crash you get N restored panes and no way to know
@@ -30,7 +47,7 @@
 # session is NOT auto-restored — you can then reopen it deliberately (`sess`).
 # (_SUPERSET_RESUME_DONE excludes the senders' `zsh -ic` probes: they are not a pane and
 # would emit a title escape into the probe's captured stdout.)
-if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \
+if [[ -o interactive ]] && (( ! _pane_resume_probe_shell )) \
    && [[ -z "$_SUPERSET_RESUME_DONE" ]] \
    && [[ "$TERM_PROGRAM" == "WarpTerminal" ]] \
    && [[ "$WARP_TERMINAL_SESSION_UUID" =~ '^[0-9a-fA-F]{32}$' ]]; then
@@ -146,7 +163,7 @@ fi
 # destroyed the restorability of the very pane you ran it from, and every later run skipped
 # that pane as "no live shell registered". Reproduced 2026-07-27; both senders already
 # set this variable in the probe's environment.
-if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \
+if [[ -o interactive ]] && (( ! _pane_resume_probe_shell )) \
    && [[ -z "$_SUPERSET_RESUME_DONE" ]] \
    && [[ "$TERM_PROGRAM" == "WarpTerminal" ]] \
    && [[ "$WARP_TERMINAL_SESSION_UUID" =~ '^[0-9a-fA-F]{32}$' ]]; then
@@ -207,7 +224,7 @@ if [[ -o interactive ]] && [[ -z "$CLAUDECODE" ]] \
 fi
 
 if [[ -o interactive ]] \
-   && [[ -z "$CLAUDECODE" ]] \
+   && (( ! _pane_resume_probe_shell )) \
    && [[ -z "$_SUPERSET_RESUME_DONE" ]] \
    && [[ -f "$HOME/.superset-recovery/armed" ]] \
    && { { [[ -n "$SUPERSET_TERMINAL_ID" ]] && [[ "$SUPERSET_TERMINAL_ID" =~ '^[0-9a-fA-F-]{36}$' ]] } \

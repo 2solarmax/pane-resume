@@ -908,10 +908,19 @@ def _warp_pane_cwd(uuid):
         return None
 
 
+_WLOG_QUIET = False   # set by read-only callers (status/plan): their resolves are not restores
+
+
 def _wlog(msg):
     """Append a one-line diagnostic to resume.log. Every no-resume path says WHY, so a
     silent 'nothing happened' after a restart is diagnosable (esp. the first reboot, which
-    validates the uuid-stability assumption). Never raises."""
+    validates the uuid-stability assumption). Never raises.
+
+    Silent under _WLOG_QUIET: 2026-10-31 a `superset-resume status` run resolved all 772
+    bindings and wrote 131 'transcript gone'/'falling back' lines minutes after a real
+    restore pass — indistinguishable from restore events, and read as one."""
+    if _WLOG_QUIET:
+        return
     try:
         with open(os.path.join(RECOV, "resume.log"), "a") as fh:
             fh.write("%s warp: %s\n" % (time.strftime("%F %T"), msg))
@@ -1157,6 +1166,8 @@ def bootstrap_warp():
 
 def warp_plan():
     """Dry-run: what WOULD resume in Warp right now (one line per live binding)."""
+    global _WLOG_QUIET
+    _WLOG_QUIET = True       # a dry run must never write restore-looking lines to resume.log
     try:
         names = sorted(os.listdir(WARP_BINDINGS))
     except OSError:
@@ -1177,8 +1188,93 @@ def warp_plan():
         print(f"{cwd}\n   claude {sid[:8]}…  {('- ' + lbl) if lbl else ''}")
 
 
+def warp_report(since_hours=48, boot=None):
+    """Which recently-active conversations are NOT running now, and why.
+
+    The question the owner asks after a restart ("which sessions suffered?") cannot be
+    answered from bindings alone: a tab Warp did not restore leaves no pane, so nothing
+    ever tries — and nothing logs. 2026-10-31: 13 conversations active in the prior 48h
+    never came back; only 1 of them would have shown up in resume.log. So start from the
+    TRANSCRIPTS (what was active), subtract what is running now (the peer registry,
+    ~/.claude/sessions/<pid>.json with a live pid), then explain each gap from the pane
+    records. Read-only; never logs."""
+    global _WLOG_QUIET
+    _WLOG_QUIET = True
+    cutoff = time.time() - since_hours * 3600
+    running = set()
+    try:
+        live = {int(l.split()[0]) for l in subprocess.run(
+            ["ps", "-Ao", "pid=,comm="], capture_output=True, text=True, timeout=15
+        ).stdout.splitlines() if "claude" in l.split(None, 1)[-1]}
+        sdir = os.path.join(HOME, ".claude", "sessions")
+        for f in os.listdir(sdir):
+            if f.endswith(".json"):
+                try:
+                    j = json.load(open(os.path.join(sdir, f)))
+                    if j.get("pid") in live and j.get("sessionId"):
+                        running.add(j["sessionId"])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    panes_now = set()
+    db = _warp_db()
+    if db:
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
+            panes_now = {r[0].hex() for r in con.execute("SELECT uuid FROM terminal_panes") if r[0]}
+            con.close()
+        except Exception:
+            pass
+    # sid -> panes that recorded it (live binding or history)
+    where = {}
+    for d in (WARP_BINDINGS, os.path.join(RECOV, "warp-history")):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            if not WARP_UUID_RE.match(n):
+                continue
+            try:
+                for ln in open(os.path.join(d, n)):
+                    parts = ln.strip().split("\t")
+                    if len(parts) >= 2 and UUID_RE.match(parts[1]):
+                        where.setdefault(parts[1], set()).add(n)
+            except OSError:
+                pass
+    missing = []
+    for path in glob.glob(os.path.join(HOME, ".claude", "projects", "*", "*.jsonl")):
+        try:
+            mt = os.path.getmtime(path)
+        except OSError:
+            continue
+        sid = os.path.basename(path)[:-6]
+        if mt < cutoff or not UUID_RE.match(sid) or sid in running:
+            continue
+        if _is_temp(os.path.dirname(path)):
+            continue
+        panes = where.get(sid, set())
+        if not panes:
+            why = "never recorded in any Warp pane (started outside Warp, or its start was suppressed)"
+        elif not (panes & panes_now):
+            why = "its tab was not restored by Warp (pane gone from Warp's saved layout)"
+        else:
+            why = "its tab came back but resumed a different conversation (or was quit)"
+        missing.append((mt, sid, _label(sid), why))
+    missing.sort(reverse=True)
+    print(f"# {len(missing)} conversation(s) active in the last {since_hours}h are NOT running now\n")
+    for mt, sid, lbl, why in missing:
+        print(f"{time.strftime('%m-%d %H:%M', time.localtime(mt))}  {sid[:8]}  {lbl or '(untitled)'}\n"
+              f"   why: {why}\n   resume: cc --resume {sid}")
+    return len(missing)
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "plan"
+    if cmd == "warp-report":
+        warp_report(int(sys.argv[2]) if len(sys.argv) >= 3 else 48)
+        sys.exit(0)
     if cmd == "resolve" and len(sys.argv) >= 4:
         print(resolve(sys.argv[2], sys.argv[3]))
     elif cmd == "resolve-warp" and len(sys.argv) >= 3:

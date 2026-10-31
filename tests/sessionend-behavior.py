@@ -67,7 +67,11 @@ with open(f"{tmp}/.superset-recovery/warp-shell/{PANE}","w") as f: f.write(f"{ow
 fire_raw({"hook_event_name":"SessionStart","session_id":NEW_SID,"cwd":"/tmp"})
 ck("binding untouched", rec("warp-bindings") == f"/tmp\t{OLD_SID}\n")
 ck("warp-last untouched", rec("warp-last") == f"/tmp\t{OLD_SID}\n")
-ck("history not polluted", NEW_SID not in open(f"{tmp}/.superset-recovery/warp-history/{PANE}").read() if os.path.exists(f"{tmp}/.superset-recovery/warp-history/{PANE}") else True)
+# 2026-10-31 (keeper): a suppressed session is still REAL and may run for days — it must
+# land in HISTORY (append-only, never the binding) or it is recorded nowhere and the
+# pane restores an older conversation after the next restart.
+_hist4 = f"{tmp}/.superset-recovery/warp-history/{PANE}"
+ck("history records the suppressed session", os.path.exists(_hist4) and NEW_SID in open(_hist4).read() and open(_hist4).read().strip().splitlines()[0].split("\t")[1] == NEW_SID)
 owner.kill(); owner.wait()
 
 print("5) SessionStart under the pane's OWN shell (owner is an ancestor):")
