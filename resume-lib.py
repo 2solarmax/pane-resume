@@ -1051,6 +1051,29 @@ def resolve_warp(uuid):
             return "claude\t%s" % hsid
         _wlog("transcript gone for %s (pane %s) — no resume" % (sid[:8], uuid[:8]))
         return ""
+    # NEWER-THAN-BINDING check (2026-10-31, keeper): a live binding is normally the
+    # pane's NEWEST session — every SessionStart rewrites it. The one case where it is
+    # NOT: the newest session's write was SUPPRESSED (the stale-uuid guard, when Warp
+    # handed the pane a spare pre-warmed shell — 10-29 22:04 "keeper" ran 2 days
+    # recorded nowhere while the binding named an older session, and the 10-31 restore
+    # brought back the WRONG conversation). Since 613c4b0 a suppressed start still
+    # lands in warp-history, so the pane's newest RECORD is now always in history[0].
+    # When history[0] names a DIFFERENT, still-resumable session than the binding, the
+    # binding is stale — prefer history[0]. A deliberately-quit session is pruned from
+    # history at SessionEnd, so this cannot resurrect a quit; guard-claimed sessions
+    # are excluded by the caller's claim step.
+    try:
+        with open(os.path.join(RECOV, "warp-history", uuid)) as fh:
+            entries = [ln.strip().split("\t") for ln in fh if ln.strip()]
+    except OSError:
+        entries = []
+    if entries and len(entries[0]) >= 3:
+        hcwd, hsid, _ts = entries[0][0], entries[0][1], entries[0][2]
+        if (hsid != sid and UUID_RE.match(hsid)
+                and _transcript_exists("claude", hcwd, hsid)):
+            _wlog("history newer than binding for pane %s — resuming %s (binding %s "
+                  "was left by a suppressed write)" % (uuid[:8], hsid[:8], sid[:8]))
+            return "claude\t%s" % hsid
     # FALLBACK 2: the session's FOLDER can vanish too — a worktree is deleted once its
     # work lands (2026-09-30: commit-gate, a one-message SDK test session, outlived its
     # worktree by a day and blocked the pane's real session from restoring). Same
