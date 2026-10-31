@@ -279,7 +279,7 @@ if [[ -o interactive ]] \
       done
       (( _young )) && return 0
       command mkdir -p "$recov/locks/$bootid" 2>/dev/null
-      command : > "$_lf" 2>/dev/null || return 0
+      : > "$_lf" 2>/dev/null || return 0
       command python3 "$lib" warp-report 48 >"$recov/last-report.txt" 2>/dev/null
       _n="$(head -1 "$recov/last-report.txt" 2>/dev/null)"
       [[ -n "$_n" ]] && print -r -- "$(command date '+%F %T') REPORT ${_n#\# } -> $recov/last-report.txt" >> "$log" 2>/dev/null
@@ -539,7 +539,7 @@ if [[ -o interactive ]] \
         fi
         ;;
     esac
-    command : > "$lockdir/exec" 2>/dev/null   # mark: reached launch -> one-shot honored, NOT reclaimable
+    : > "$lockdir/exec" 2>/dev/null   # mark: reached launch -> one-shot honored, NOT reclaimable
     if (( is_warp )); then
       _pane_resume_report_if_last   # last pane of the wave reports what did not come back
     fi
