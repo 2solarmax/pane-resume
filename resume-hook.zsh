@@ -252,6 +252,39 @@ if [[ -o interactive ]] \
       print -r -- "${name:-this conversation} $why"
     }
 
+    # ── POST-RESTORE REPORT (2026-10-31) ─────────────────────────────────────────────
+    # "Which sessions did NOT come back?" must answer itself. 2026-10-31 14:07: Warp
+    # dropped one live tab from its saved layout (pane a11bf989 / be38b7f2 — lost by
+    # Warp, not by this tool), and NOTHING told the owner: the report existed but only
+    # ran when he asked. So the LAST pane of a restore pass fires it (once per Warp
+    # run) and writes the list to last-report.txt, where it survives the session. The
+    # stamp file keys on the run id, so a re-sourced .zshrc never re-fires it and a
+    # relaunch (new epoch) reports again. Cheap in the common case: every pane except
+    # the last exits at the stamp-file test. (bootid may not be computed yet on the
+    # no-plan early path — compute it here; the guards above it stay cheap.)
+    _pane_resume_report_if_last() {
+      local _lf _n _young=0 _d
+      [[ -n "$bootid" ]] || bootid="$(command python3 "$lib" warp-epoch 2>/dev/null)"
+      [[ -n "$bootid" ]] || return 0
+      _lf="$recov/locks/$bootid/.report-stamp"
+      [[ -e "$_lf" ]] && return 0
+      # A restore wave is "over" when no pane lock dir in this epoch is younger than
+      # ~25s (panes create theirs within seconds of Warp restoring the tab). If any
+      # are younger, THIS pane returns and a later pane runs the report.
+      for _d in "$recov/locks/$bootid"/*(N); do
+        [[ -d "$_d" ]] || continue
+        if (( $(date +%s) - $(stat -f %m "$_d" 2>/dev/null || echo 0) < 25 )); then
+          _young=1; break
+        fi
+      done
+      (( _young )) && return 0
+      command mkdir -p "$recov/locks/$bootid" 2>/dev/null
+      command : > "$_lf" 2>/dev/null || return 0
+      command python3 "$lib" warp-report 48 >"$recov/last-report.txt" 2>/dev/null
+      _n="$(head -1 "$recov/last-report.txt" 2>/dev/null)"
+      [[ -n "$_n" ]] && print -r -- "$(command date '+%F %T') REPORT ${_n#\# } -> $recov/last-report.txt" >> "$log" 2>/dev/null
+    }
+
     # 1) Detect the terminal + resolve FIRST. Each resolver is existence-checked (the
     #    transcript must still exist) and returns empty on any transient/absent case, so a
     #    no-binding pane or a hiccup is a safe no-op the next shell can retry. Both return
@@ -276,6 +309,9 @@ if [[ -o interactive ]] \
       # logs its own reason for the cases it can name; this catches the rest so no pane can
       # exit this block without an account of why.
       print -r -- "$(command date '+%F %T') SKIP term=$termid reason=no-resolvable-conversation" >> "$log" 2>/dev/null
+      if (( is_warp )); then
+        _pane_resume_report_if_last
+      fi
       return 0
     fi
     IFS=$'\t' read -rA parts <<<"$plan"
@@ -329,9 +365,16 @@ if [[ -o interactive ]] \
       print -r -- "$(command date '+%F %T') SKIP term=$termid sid=$sid reason=no-epoch-id" >> "$log" 2>/dev/null
       return 0
     fi
-    # opportunistically reap other-boot lock dirs (bounded on-disk state); slots/ is
-    # legacy stagger state (removed 2026-07-14) — clear it entirely if still present
-    command find "$recov/locks" -mindepth 1 -maxdepth 1 -type d ! -name "$bootid" -exec rm -rf {} + 2>/dev/null
+    # opportunistically reap other-boot lock dirs (bounded on-disk state). 2026-10-31
+    # red team: a pane that fell back to the NUMERIC boot id (warp-epoch unreadable
+    # under load) used to delete every warp-* lock dir — including the LIVE run's — so
+    # panes could resume twice in one restore. Only a warp-run id may reap; the numeric
+    # fallback names no run and proves nothing about the others.
+    if [[ "$bootid" == warp-* ]]; then
+      command find "$recov/locks" -mindepth 1 -maxdepth 1 -type d ! -name "$bootid" -exec rm -rf {} + 2>/dev/null
+    fi
+    # slots/ is legacy stagger state (removed 2026-07-14) — clear it entirely if still present
+    command rm -rf "$recov/slots" 2>/dev/null
     command rm -rf "$recov/slots" 2>/dev/null
     lockroot="$recov/locks/$bootid"
     command mkdir -p "$lockroot" 2>/dev/null || return 0
@@ -497,6 +540,9 @@ if [[ -o interactive ]] \
         ;;
     esac
     command : > "$lockdir/exec" 2>/dev/null   # mark: reached launch -> one-shot honored, NOT reclaimable
+    if (( is_warp )); then
+      _pane_resume_report_if_last   # last pane of the wave reports what did not come back
+    fi
     # Drain tty type-ahead before handing the pane to the agent. A terminal may re-send the
     # pane's preset command text on restore; while zshrc runs it sits unread in the tty buffer
     # and would otherwise be delivered INTO the resumed agent as junk prompt input (or execute

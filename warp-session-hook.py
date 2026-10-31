@@ -9,7 +9,9 @@ restart (Warp restores the pane + cwd but drops it to an idle shell).
   = "<cwd>\t<session_id>"  (a marker that a live session exists in this pane).
 - SessionEnd:   remove that binding IF it belongs to the ending session (a clean exit
   => don't resume it on reboot; a reboot SIGKILLs the process so SessionEnd never fires
-  => the binding survives => we DO resume it).
+  => the binding survives => we DO resume it). A deliberate quit also leaves a
+  warp-quit/<sid> marker so the sid can never be resurrected through another pane's
+  history (the same conversation can appear in several panes' records).
 
 No-op everywhere except a Warp pane. Fast, dependency-free, never raises (a hook that
 errors must not disrupt the session). Skips sub-agent / forked sessions (not the pane's
@@ -39,6 +41,29 @@ def _ancestor_pids(start):
             break
         cur = nxt
     return pids
+
+
+def _append_history(recov, uuid, cwd, sid):
+    """Record the session in warp-history/<uuid> (newest first, dedup by sid, capped).
+    The single writer for BOTH callers — mainline SessionStart and the suppressed
+    stale-uuid path — so the cap cannot drift between two copies (2026-10-31 red team:
+    the duplicated cap let a mutant escape the suite, and 11 tool children could evict
+    both the pane's real session and a suppressed one)."""
+    hpath = os.path.join(recov, "warp-history", uuid)
+    prev = []
+    try:
+        with open(hpath) as fh:
+            prev = [ln.strip() for ln in fh if ln.strip()]
+    except OSError:
+        pass
+    entry = "%s\t%s\t%d" % (cwd, sid, int(time.time()))
+    prev = [e for e in prev if e.split("\t")[1:2] != [sid]]   # dedup: a re-run moves to front
+    prev.insert(0, entry)
+    prev = prev[:10]                                           # cap
+    tmp = hpath + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(prev) + "\n")
+    os.replace(tmp, hpath)
 
 
 def _stale_env_uuid(uuid, recov):
@@ -99,49 +124,17 @@ def main():
         cwd = data.get("cwd") or os.getcwd()
         if not UUID_RE.match(sid or ""):
             return
-        # A session started under a STALE pane id must not overwrite the pane's real
-        # record — the registered owner shell is alive but is not this session's shell.
-        # But the session itself may be REAL and long-lived: 2026-10-29..31, the owner
-        # was a spare pre-warmed shell Warp had handed into pane 8e76fae8 (pid 22185),
-        # Max resumed "keeper" (96584429) into that pane by hand, the write was
-        # suppressed, and the conversation then ran 2 days recorded NOWHERE — after the
-        # 10-31 restart the pane restored an OLDER session instead. So: still append to
-        # the pane's HISTORY (append-only, never the single-slot live binding). The
-        # resolver's history fallback can then find it; a deliberately-quit session is
-        # pruned from history by SessionEnd as usual, so this cannot resurrect a quit.
-        if _stale_env_uuid(uuid, os.path.dirname(bdir)):
-            try:
-                with open(os.path.join(os.path.dirname(bdir), "resume.log"), "a") as fh:
-                    fh.write("%s warp: SessionStart pane=%s sid=%s — stale uuid, pane owned by another live shell; write suppressed (history kept)\n"
-                             % (time.strftime("%F %T"), uuid[:8], sid[:8]))
-            except OSError:
-                pass
-            try:
-                hpath = os.path.join(os.path.dirname(bdir), "warp-history", uuid)
-                os.makedirs(os.path.dirname(hpath), exist_ok=True)
-                prev = []
-                try:
-                    with open(hpath) as fh:
-                        prev = [ln.strip() for ln in fh if ln.strip()]
-                except OSError:
-                    pass
-                entry = "%s\t%s\t%d" % (cwd, sid, int(time.time()))
-                prev = [e for e in prev if e.split("\t")[1:2] != [sid]]
-                prev.insert(0, entry)
-                prev = prev[:10]
-                tmp = hpath + ".tmp"
-                with open(tmp, "w") as fh:
-                    fh.write("\n".join(prev) + "\n")
-                os.replace(tmp, hpath)
-            except Exception:
-                pass
-            return
-        # Skip tool/print-mode sessions (`claude -p`, Bash-tool claude, SDK): they are
-        # not the pane's conversation, but their SessionStart inherited the pane uuid, so
-        # writing here evicts the pane's REAL binding — 2026-10-16: a morning deny-test
-        # claude spawned by the pane's own session overwrote the "automations monitor"
-        # tab's record; the restart then wiped the temp cwd and the tab restored to
-        # nothing while its real conversation sat resumable the whole time.
+        # Skip tool/print-mode sessions (`claude -p`, Bash-tool claude, SDK) FIRST, before
+        # ANY write: they are not the pane's conversation, but their SessionStart
+        # inherited the pane uuid, so writing here evicts the pane's REAL binding —
+        # 2026-10-16: a morning deny-test claude spawned by the pane's own session
+        # overwrote the "automations monitor" tab's record; the restart then wiped the
+        # temp cwd and the tab restored to nothing while its real conversation sat
+        # resumable the whole time. 2026-10-31 red team: this check ran AFTER the
+        # stale-uuid branch, so a tool session under a stale pane id still landed at
+        # warp-history[0] and the resolver would restore it in place of the real
+        # conversation — the 2026-10-16 incident again, through history. Order matters:
+        # no record at all, in either path, for a tool session.
         if os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "sdk-cli":
             try:
                 with open(os.path.join(os.path.dirname(bdir), "resume.log"), "a") as fh:
@@ -150,6 +143,46 @@ def main():
             except OSError:
                 pass
             return
+        # A session started under a STALE pane id must not overwrite the pane's real
+        # record — the registered owner shell is alive but is not this session's shell.
+        # But the session itself may be REAL and long-lived: 2026-10-29..31, the owner
+        # was a spare pre-warmed shell Warp had handed into pane 8e76fae8 (pid 22185),
+        # Max resumed "keeper" (96584429) into that pane by hand, the write was
+        # suppressed, and the conversation then ran 2 days recorded NOWHERE — after the
+        # 10-31 restart the pane restored an OLDER session instead. So: still append to
+        # the pane's HISTORY (append-only, never the single-slot live binding). The
+        # resolver's recency-gated history preference can then find it. A deliberately
+        # quit session is excluded globally by its warp-quit marker, so this cannot
+        # resurrect a quit.
+        if _stale_env_uuid(uuid, os.path.dirname(bdir)):
+            try:
+                with open(os.path.join(os.path.dirname(bdir), "resume.log"), "a") as fh:
+                    fh.write("%s warp: SessionStart pane=%s sid=%s — stale uuid, pane owned by another live shell; write suppressed (history kept)\n"
+                             % (time.strftime("%F %T"), uuid[:8], sid[:8]))
+            except OSError:
+                pass
+            # Live again, even under a stale pane id: clear any earlier quit marker for
+            # THIS sid, or the conversation the user just reopened by hand here would be
+            # skipped at the next restore (real sequence in resume.log 2026-10-29
+            # 20:13:59: quit marker would have outlived a suppressed reopen 14s later).
+            try:
+                os.remove(os.path.join(os.path.dirname(bdir), "warp-quit", sid))
+            except OSError:
+                pass
+            try:
+                os.makedirs(os.path.join(os.path.dirname(bdir), "warp-history"), exist_ok=True)
+                _append_history(os.path.dirname(bdir), uuid, cwd, sid)
+            except Exception:
+                pass
+            return
+        # The session is live again (start/resume/compact): any earlier deliberate-quit
+        # marker is obsolete — remove it so the resolver will consider this sid again.
+        # A marker left behind here would suppress the resume of the very conversation
+        # the user just reopened by hand.
+        try:
+            os.remove(os.path.join(os.path.dirname(bdir), "warp-quit", sid))
+        except OSError:
+            pass
         rec = "%s\t%s\n" % (cwd, sid)
         for path in (bpath, lpath):
             try:
@@ -168,34 +201,21 @@ def main():
         # so the resolver can fall back. Newest first, dedup by sid, capped.
         # A failure here must never disturb the primary binding.
         try:
-            hpath = os.path.join(os.path.dirname(bdir), "warp-history", uuid)
-            os.makedirs(os.path.dirname(hpath), exist_ok=True)
-            prev = []
-            try:
-                with open(hpath) as fh:
-                    prev = [ln.strip() for ln in fh if ln.strip()]
-            except OSError:
-                pass
-            ts = int(__import__("time").time())
-            entry = "%s\t%s\t%d" % (cwd, sid, ts)
-            prev = [e for e in prev if e.split("\t")[1:2] != [sid]]   # dedup: a re-run moves to front
-            prev.insert(0, entry)
-            prev = prev[:10]                                             # cap
-            tmp = hpath + ".tmp"
-            with open(tmp, "w") as fh:
-                fh.write("\n".join(prev) + "\n")
-            os.replace(tmp, hpath)
+            os.makedirs(os.path.join(os.path.dirname(bdir), "warp-history"), exist_ok=True)
+            _append_history(os.path.dirname(bdir), uuid, cwd, sid)
         except Exception:
             pass
 
     elif ev == "SessionEnd":
         ending = data.get("session_id") or ""
         reason = data.get("reason") or "unknown"
-        # Log the reason so we can tell a real user-quit from a crash-driven shutdown.
+        # Log the reason (and the sid — the 2026-10-31 audit could not attribute quit
+        # events to conversations without it) so we can tell a real user-quit from a
+        # crash-driven shutdown.
         try:
             with open(os.path.join(os.path.dirname(bdir), "resume.log"), "a") as fh:
-                fh.write("%s warp: SessionEnd pane=%s reason=%s\n"
-                         % (__import__("time").strftime("%F %T"), uuid[:8], reason))
+                fh.write("%s warp: SessionEnd pane=%s sid=%s reason=%s\n"
+                         % (time.strftime("%F %T"), uuid[:8], (ending or "?")[:8], reason))
         except Exception:
             pass
         # A DELIBERATE quit releases the binding. Max, 2026-08-23, clarifying the
@@ -216,27 +236,71 @@ def main():
         # (~/.claude/sessions/<pid>.json) is the liveness source.
         if reason == "prompt_input_exit" and ending:
             sid = ending if UUID_RE.match(ending) else ""
-            # The HISTORY prune is NOT behind the liveness guard: a deliberate quit must
-            # never be resurrected by the fallback, whatever else is running — the guard
-            # exists for the BINDING's different failure (a same-pane hand --resume fires
-            # prompt_input_exit transitively and must keep its target resumable). A quit
-            # session being resumed by hand elsewhere writes its own fresh history entry
-            # at that pane's next SessionStart, so nothing is lost.
-            try:
-                hpath = os.path.join(os.path.dirname(bdir), "warp-history", uuid)
-                with open(hpath) as fh:
-                    keep = [ln.strip() for ln in fh
-                            if ln.strip() and ln.strip().split("\t")[1:2] != [sid]]
-                tmp = hpath + ".tmp"
-                with open(tmp, "w") as fh:
-                    fh.write("\n".join(keep) + ("\n" if keep else ""))
-                os.replace(tmp, hpath)
-            except OSError:
-                pass
+            # A quit is only a quit when NO live copy remains. The liveness guard is the
+            # load-bearing half for EVERYTHING below (marker, global history prune,
+            # binding release) — not just the binding: a same-pane hand `--resume`
+            # (ccr) fires prompt_input_exit transitively and can fire it AFTER the new
+            # copy's SessionStart already cleared the quit marker and re-recorded
+            # history. An unconditional write would leave a stale marker naming a LIVE
+            # conversation, and the next restart would refuse to restore it — the exact
+            # 2026-07-27 lost-session failure this file exists to prevent. When a twin
+            # is live the conversation continues; its own eventual true quit fires this
+            # path again with no twin, and marks/prunes then.
             if sid and not _sid_live_elsewhere(sid):
+                # 2026-10-31 red team: pruning only THIS pane's file was not enough —
+                # the same conversation legitimately appears in SEVERAL panes' history
+                # files (suppressed starts, hand-resumes into other tabs), and a sid
+                # left in another pane's history was resurrected there by the
+                # resolver's history-preference rule. Two closures:
+                #  (a) prune the sid from EVERY pane's history file (the sid is
+                #      global — one quit means quit everywhere);
+                #  (b) write warp-quit/<sid> with the quit time, honoured by the
+                #      resolver on every route (binding, warp-last, history). The
+                #      session's own next SessionStart anywhere removes the marker, so
+                #      a hand-reopened conversation is resumable again.
+                # A marker newer than a history entry prunes it at read time too, so a
+                # concurrent append race cannot re-arm a quit.
+                try:
+                    qdir = os.path.join(os.path.dirname(bdir), "warp-quit")
+                    os.makedirs(qdir, exist_ok=True)
+                    qtmp = os.path.join(qdir, sid) + ".tmp"
+                    with open(qtmp, "w") as fh:
+                        fh.write("%d\n" % int(time.time()))
+                    os.replace(qtmp, os.path.join(qdir, sid))
+                except OSError:
+                    pass
+                hroot = os.path.join(os.path.dirname(bdir), "warp-history")
+                try:
+                    for name in os.listdir(hroot):
+                        hpath = os.path.join(hroot, name)
+                        try:
+                            with open(hpath) as fh:
+                                lines = [ln.strip() for ln in fh if ln.strip()]
+                        except OSError:
+                            continue
+                        keep = [ln for ln in lines
+                                if ln.split("\t")[1:2] != [sid]]
+                        if len(keep) != len(lines):   # never rewrite files we did not change
+                            tmp = hpath + ".tmp"
+                            with open(tmp, "w") as fh:
+                                fh.write("\n".join(keep) + ("\n" if keep else ""))
+                            os.replace(tmp, hpath)
+                except OSError:
+                    pass
+                # Remove a record ONLY when it names the quitting sid. The env pane id
+                # can be STALE for a suppressed session (the keeper configuration), and
+                # an unconditional remove deleted the REAL pane's binding for a session
+                # that never owned it — the pane then restored empty. Per-record, so a
+                # mixed state (binding names A, warp-last names the quitter) does the
+                # right thing for each.
                 for path in (bpath, lpath):
                     try:
-                        os.remove(path)
+                        with open(path) as fh:
+                            recorded = fh.read().strip().split("\t")
+                        if len(recorded) >= 2 and recorded[1] == sid:
+                            os.remove(path)
+                    except FileNotFoundError:
+                        pass
                     except OSError:
                         pass
         return
@@ -247,7 +311,8 @@ def _sid_live_elsewhere(sid):
     try:
         sdir = os.path.join(os.path.expanduser("~"), ".claude", "sessions")
         live_pids = set()
-        for ln in os.popen("ps -Ao pid=,comm=").read().splitlines():
+        for ln in subprocess.run(["ps", "-Ao", "pid=,comm="],
+                                 capture_output=True, text=True).stdout.splitlines():
             parts = ln.split(None, 1)
             if len(parts) == 2 and "claude" in os.path.basename(parts[1].strip()):
                 live_pids.add(int(parts[0]))

@@ -33,9 +33,10 @@ CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
 UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")       # claude/superset ids: 36-char dashed UUID
 WARP_UUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")   # Warp pane id: 32 hex, no dashes
 WARP_BINDINGS = os.path.join(RECOV, "warp-bindings")
-# Durable last-seen pane->session record. NEVER deleted by SessionEnd — the
-# crash-proof fallback (2026-07-27: a Warp crash fired SessionEnd on 23 live
-# sessions and wiped their bindings). resolve_warp falls back to this.
+# Durable last-seen pane->session record. Removed by SessionEnd ONLY for a deliberate
+# quit of that same sid (crash-driven ends keep it) — the crash-proof fallback
+# (2026-07-27: a Warp crash fired SessionEnd on 23 live sessions and wiped their
+# bindings). resolve_warp falls back to this.
 WARP_LAST = os.path.join(RECOV, "warp-last")
 
 
@@ -644,17 +645,45 @@ def _has_window(pid, sid=None):
         return True
 
 
+def _epoch_run_over(name):
+    """True when the Warp run an epoch folder was named for is PROVABLY over.
+
+    The epoch id encodes the app pid and start time (`warp-<pid>-<lstart>`): the run is
+    over when that pid is dead, or alive with a DIFFERENT start time (pid reuse — the
+    lstart no longer matches the id). A non-`warp-` epoch (the numeric boot-id fallback)
+    names no owner at all, so it can never be proven over — leave it; a 'warp-' prefix
+    mismatch (the two fallback shapes) is never evidence about the other run. Anything
+    unreadable is NOT proven over (fail toward leaving the folder alone)."""
+    m = re.match(r"^warp-(\d+)-(.+)$", name)
+    if not m:
+        return False
+    pid, lst = m.group(1), m.group(2)
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", pid],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return False
+    if not out:
+        return True                            # no such process: the run is dead
+    return re.sub(r"[^0-9A-Za-z]", "", out) != lst   # pid reused by a different start
+
+
 def claim_conversation(sid, epoch):
     """Reserve this conversation for THIS pane, so no other pane restores it too.
 
     `mkdir` IS the claim: it is atomic, so of N panes racing for one conversation exactly one
     wins. No lock file to corrupt, no pid to go stale, no releaser to spawn.
 
-    Namespaced by the terminal run (`epoch`), and other runs' claims are reaped on the way
-    in — the same shape as the one-shot pane lock. That is what makes expiry unnecessary:
-    the dangerous case is a crash at T and a relaunch at T+3min, where a time-expiring claim
-    from the dead run would refuse the very restore it exists to enable. A claim from a
-    previous run is meaningless by construction, so it is removed rather than waited out.
+    Namespaced by the terminal run (`epoch`). A claim from a PREVIOUS run is meaningless
+    by construction (the dangerous case is a crash at T and a relaunch at T+3min, where a
+    stale claim would refuse the very restore it exists to enable), so a run that is
+    PROVABLY OVER has its folder removed. "Provably over" = the Warp app pid encoded in
+    the epoch name is no longer that run — dead, or alive with a different start time
+    (pid reuse). Anything else — including a numeric boot-id epoch (its owner could not
+    be identified) and a live concurrent run — is left untouched: 2026-10-31 red team
+    reproduced the old reaper emptying ANOTHER epoch's folder of its LIVE claims, after
+    which a third pane claimed the same conversation and two panes ran one transcript
+    (the 2026-07-27 failure class).
 
     Returns True when this pane may proceed. Any error returns True — a restore that refuses
     to restore is worse than a duplicate risk we cannot even measure."""
@@ -665,17 +694,17 @@ def claim_conversation(sid, epoch):
     try:
         root = os.path.join(RECOV, "resuming")
         os.makedirs(root, exist_ok=True)
-        for name in os.listdir(root):          # reap runs that are over
+        for name in os.listdir(root):
             if name == epoch:
                 continue
             stale = os.path.join(root, name)
-            # rmdir, not rm -rf: it REFUSES a directory that still holds claims. A run whose
-            # panes are mid-restore keeps them — a pane can sit in the start-throttle for
-            # minutes with no agent visible yet, and its claim is the only thing standing
-            # between that conversation and a second writer.
+            # rmdir, not rm -rf: it REFUSES a directory that still holds claims. A run
+            # whose panes are mid-restore keeps them — a pane can sit in the
+            # start-throttle for minutes with no agent visible yet, and its claim is the
+            # only thing standing between that conversation and a second writer.
+            if not _epoch_run_over(name):
+                continue
             try:
-                for c in os.listdir(stale):
-                    os.rmdir(os.path.join(stale, c))
                 os.rmdir(stale)
             except OSError:
                 pass
@@ -991,23 +1020,94 @@ def pane_owned_elsewhere(uuid, myself):
     return 1
 
 
+def _quit_at(sid):
+    """When this conversation was last DELIBERATELY QUIT, if ever.
+
+    warp-quit/<sid> is written by SessionEnd on prompt_input_exit (2026-10-31 red team:
+    pruning only the quitting pane's history left the sid resumable through every OTHER
+    pane that had recorded it — the same conversation legitimately appears in several
+    panes' records). The session's own next SessionStart anywhere removes the marker, so
+    a hand-reopened conversation is resumable again. Returns the quit unix-time or None;
+    any read error is treated as not-quit (fail toward restorable)."""
+    try:
+        with open(os.path.join(RECOV, "warp-quit", sid)) as fh:
+            return int(fh.read().strip() or 0) or None
+    except (OSError, ValueError):
+        return None
+
+
+def _entrypoint_of(sid):
+    """The entrypoint this conversation was started with ('cli', 'sdk-cli', …) or ''.
+
+    The transcript's own records carry it. Read-only, bounded: entrypoint is decided at
+    session start and never changes, so the FIRST occurrence is authoritative and the
+    scan stops there. This is the resolver-side half of the tool-session exclusion —
+    the hook-side gate came first, but 27 sdk-cli entries already sit in real history
+    files written before bf47095, and they pass every existence check."""
+    tr = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", sid + ".jsonl"))
+    if not tr:
+        return ""
+    try:
+        with open(tr[0], errors="ignore") as fh:
+            for line in fh:
+                if '"entrypoint"' not in line:
+                    continue
+                try:
+                    ep = json.loads(line).get("entrypoint")
+                except Exception:
+                    continue
+                if ep:
+                    return ep
+                break
+    except OSError:
+        pass
+    return ""
+
+
+def _interactive(sid):
+    """True when sid is (or was) an INTERACTIVE conversation, not a tool/print run."""
+    return _entrypoint_of(sid) != "sdk-cli"
+
+
+def _hist_ts(rec):
+    """A history record's own timestamp as unix seconds, or None (legacy/malformed)."""
+    try:
+        return int(rec[2])
+    except (IndexError, ValueError):
+        return None
+
+
 def _history_resume(uuid, sid, need_dir):
-    """Newest other history entry for this pane that is still resumable — transcript on
-    disk, and (need_dir) its own folder still present. Newest first; returns sid or None."""
+    """Newest RESUMABLE other history entry for this pane, or None.
+
+    Resumable = transcript on disk, its own folder still present (need_dir), not a
+    tool/print session, and not newer-than-a-deliberate-quit. Newest by the record's own
+    TIMESTAMP, not file position — 2026-10-31 red team: real pane 791631fb's history
+    file is oldest-first (hand-repaired 2026-10-16), so position [0] named a deleted
+    /private/tmp deny-test session while the pane's 138 MB real conversation sat at the
+    file's end. Trust the numbers, sort, then walk."""
     hpath = os.path.join(RECOV, "warp-history", uuid)
     try:
         with open(hpath) as fh:
             entries = [ln.strip().split("\t") for ln in fh if ln.strip()]
     except OSError:
         entries = []
+    entries = [e for e in entries if len(e) >= 2 and e[1] != sid]
+    entries.sort(key=lambda e: _hist_ts(e) or 0, reverse=True)   # newest recorded first
     for i, e in enumerate(entries):
-        if len(e) < 2 or e[1] == sid:
-            continue
         hcwd, hsid = e[0], e[1]
-        if _transcript_exists("claude", hcwd, hsid) and (not need_dir or os.path.isdir(hcwd)):
-            _wlog("falling back for %s (pane %s) — resuming %s from history (entry %d of %d)"
-                  % (sid[:8], uuid[:8], hsid[:8], i + 1, len(entries)))
-            return hsid
+        if not _transcript_exists("claude", hcwd, hsid):
+            continue
+        if need_dir and not os.path.isdir(hcwd):
+            continue
+        if not _interactive(hsid):
+            continue
+        q = _quit_at(hsid)
+        if q is not None and q > (_hist_ts(e) or 0):
+            continue   # quit AFTER this record: the entry is dead, keep walking
+        _wlog("falling back for %s (pane %s) — resuming %s from history (entry %d of %d)"
+              % (sid[:8], uuid[:8], hsid[:8], i + 1, len(entries)))
+        return hsid
     return None
 
 
@@ -1039,38 +1139,98 @@ def resolve_warp(uuid):
     if not sid or not UUID_RE.match(sid):
         _wlog("bad session id in binding for pane %s — no resume" % uuid[:8])
         return ""
+    # A deliberately-quit conversation must NEVER come back on its own (Max, 2026-08-23).
+    # The binding is the record most likely to name a quit sid (this pane's own quit
+    # removes it, but a quit in ANOTHER pane that shared the record does not). The quit
+    # marker carries the quit TIME; the binding carries none, so any marker beats it.
+    # A live twin never does (the marker's writer skips it). Fall through to history
+    # only when it holds something still resumable.
+    if _quit_at(sid) is not None:
+        _wlog("binding names a deliberately-quit conversation for pane %s (%s) — "
+              "checking history" % (uuid[:8], sid[:8]))
+        hsid = _history_resume(uuid, sid, need_dir=False)
+        return "claude\t%s" % hsid if hsid else ""
     # transcript must still exist, else `claude --resume` starts a FRESH session
     if not _transcript_exists("claude", cwd, sid):
         # FALLBACK: the binding is a single slot that SessionStart overwrites, so the
         # dead sid may be crash debris that evicted the pane's real session (2026-08-31:
         # maxpool). The pane's own history knows what else ran here. Resume the newest
-        # entry whose transcript still exists; a deliberately-quit sid is never in the
-        # history (SessionEnd removes it), so this cannot resurrect a quit session.
+        # resumable entry; quit sessions are excluded by their warp-quit markers.
         hsid = _history_resume(uuid, sid, need_dir=False)
         if hsid:
             return "claude\t%s" % hsid
         _wlog("transcript gone for %s (pane %s) — no resume" % (sid[:8], uuid[:8]))
         return ""
-    # NEWER-THAN-BINDING check (2026-10-31, keeper): a live binding is normally the
-    # pane's NEWEST session — every SessionStart rewrites it. The one case where it is
-    # NOT: the newest session's write was SUPPRESSED (the stale-uuid guard, when Warp
-    # handed the pane a spare pre-warmed shell — 10-29 22:04 "keeper" ran 2 days
-    # recorded nowhere while the binding named an older session, and the 10-31 restore
-    # brought back the WRONG conversation). Since 613c4b0 a suppressed start still
-    # lands in warp-history, so the pane's newest RECORD is now always in history[0].
-    # When history[0] names a DIFFERENT, still-resumable session than the binding, the
-    # binding is stale — prefer history[0]. A deliberately-quit session is pruned from
-    # history at SessionEnd, so this cannot resurrect a quit; guard-claimed sessions
-    # are excluded by the caller's claim step.
+    # SUPPRESSED-WRITE check (2026-10-31, keeper; hardened by the red team same day): a
+    # live binding is normally the pane's newest session — every SessionStart rewrites
+    # it. The one case where it is NOT: the newest session's write was SUPPRESSED (the
+    # stale-uuid guard, when Warp handed the pane a spare pre-warmed shell — 10-29 22:04
+    # "keeper" ran 2 days recorded nowhere while the binding named an older session, and
+    # the 10-31 restore brought back the WRONG conversation). A suppressed start still
+    # lands in warp-history, so such a session is findable there. But history records
+    # were NEVER a proof of recency by position (real pane 791631fb: a hand-repaired
+    # oldest-first file; legacy sdk-cli entries older than the binding), so the
+    # preference is EARNED by all of:
+    #   (a) the candidate's own record timestamp is strictly newer than the binding
+    #       record's timestamp (its own history entry — file mtimes lie: repairs and
+    #       copies rewrite them);
+    #   (b) the candidate is an INTERACTIVE conversation (entrypoint != sdk-cli) —
+    #       tool/print sessions must never bind a pane, whatever a legacy file says;
+    #   (c) it was not quit after that record (warp-quit marker);
+    #   (d) it is launchable: transcript on disk, its folder still present, not under a
+    #       temp root — the same bar FALLBACK 2 enforces, so the rule can never swap a
+    #       resumable binding for an unlaunchable candidate and leave the pane empty.
+    # Any failure keeps the binding. The not-chosen candidate is NOT lost: warp-report
+    # lists it as not-restored with its resume command.
     try:
         with open(os.path.join(RECOV, "warp-history", uuid)) as fh:
-            entries = [ln.strip().split("\t") for ln in fh if ln.strip()]
+            _all = [ln.strip().split("\t") for ln in fh if ln.strip()]
     except OSError:
-        entries = []
-    if entries and len(entries[0]) >= 3:
-        hcwd, hsid, _ts = entries[0][0], entries[0][1], entries[0][2]
-        if (hsid != sid and UUID_RE.match(hsid)
-                and _transcript_exists("claude", hcwd, hsid)):
+        _all = []
+    # The binding record's own time FIRST (from the unfiltered list — the binding's
+    # row is about to be filtered out as the sid we already have), then the candidates.
+    bts = None
+    for e in _all:
+        if len(e) >= 2 and e[1] == sid:
+            bts = _hist_ts(e)
+            break
+    if bts is None:
+        try:
+            bts = int(os.path.getmtime(os.path.join(
+                WARP_BINDINGS if src == "live" else WARP_LAST, uuid))) or None
+        except OSError:
+            bts = None
+    _entries = [e for e in _all if len(e) >= 2 and e[1] != sid]
+    _entries.sort(key=lambda e: _hist_ts(e) or 0, reverse=True)
+    if _entries:
+        hcwd, hsid = _entries[0][0], _entries[0][1]
+        hts = _hist_ts(_entries[0])
+        q = _quit_at(hsid)
+        #   (e) the candidate is also the pane's more recently USED conversation
+        #       (transcript mtime — what warp-report calls activity). Record order says
+        #       which session STARTED last; activity says which one Max was actually in.
+        #       A suppressed start recorded late in a stray tab (2026-10-31 red team S4:
+        #       even a compact re-arms the record) must never demote the conversation
+        #       the pane's occupant was actively using. Both must agree the candidate
+        #       is newer, or the binding keeps the pane and the candidate surfaces in
+        #       warp-report with its resume command.
+        try:
+            hmt = os.path.getmtime(glob.glob(os.path.join(
+                CLAUDE_PROJECTS, "*", hsid + ".jsonl"))[0])
+        except (OSError, IndexError):
+            hmt = None
+        try:
+            bmt = os.path.getmtime(glob.glob(os.path.join(
+                CLAUDE_PROJECTS, "*", sid + ".jsonl"))[0])
+        except (OSError, IndexError):
+            bmt = None
+        if (hts is not None and bts is not None and hts > bts
+                and hmt is not None and bmt is not None and hmt > bmt
+                and UUID_RE.match(hsid)
+                and _transcript_exists("claude", hcwd, hsid)
+                and os.path.isdir(hcwd) and not _is_temp(hcwd)
+                and _interactive(hsid)
+                and not (q is not None and q > hts)):
             _wlog("history newer than binding for pane %s — resuming %s (binding %s "
                   "was left by a suppressed write)" % (uuid[:8], hsid[:8], sid[:8]))
             return "claude\t%s" % hsid
@@ -1277,6 +1437,11 @@ def warp_report(since_hours=48, boot=None):
             continue
         if _is_temp(os.path.dirname(path)):
             continue
+        q = _quit_at(sid)
+        if q is not None and q > int(mt):
+            continue   # deliberately quit after its last activity: not "suffered"
+        if _entrypoint_of(sid) == "sdk-cli":
+            continue   # a tool/print run, not a conversation the owner sat in
         panes = where.get(sid, set())
         if not panes:
             why = "never recorded in any Warp pane (started outside Warp, or its start was suppressed)"
@@ -1313,9 +1478,11 @@ if __name__ == "__main__":
     elif cmd == "bootid":
         print(boot_id())
     elif cmd == "warp-epoch":
-        fp = None
-        if len(sys.argv) >= 4 and sys.argv[3] == "--from-parent":
-            fp = os.getppid()
+        # `--from-parent` in ANY position (2026-10-31 red team: the hook calls
+        # `warp-epoch --from-parent`, which put the flag at argv[2] while this read
+        # argv[3] — from_pid stayed None and the relaunch-overlap ancestry walk
+        # (2026-08-23) never ran).
+        fp = os.getppid() if "--from-parent" in sys.argv[2:] else None
         print(warp_epoch(from_pid=fp))
     elif cmd == "label" and len(sys.argv) >= 3:
         print(_label(sys.argv[2]))

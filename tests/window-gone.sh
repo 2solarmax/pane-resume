@@ -69,7 +69,9 @@ ck "G1 leaked markers + Warp parent: hook ran (registered)" "$( [ -f $TMP/.super
 ck "G1 markers scrubbed in the pane shell" "$outg1" "MARKER=0 CHILD=0"
 outg2=$(env -i HOME="$TMP" PATH="$PATH" TERM_PROGRAM=WarpTerminal WARP_TERMINAL_SESSION_UUID=$GU2 CLAUDECODE=1 CLAUDE_CODE_CHILD_SESSION=1 zsh -f -i -c "source ${(qq)HOOK}" 2>&1 </dev/null)
 ck "G2 probe shell (claude parent): stays silent" "$( [ -f $TMP/.superset-recovery/warp-shell/$GU2 ] && echo YES || echo NO )" "NO"
-ck "G2 probe shell: no title emitted" "$(print -r -- $outg2 | wc -l | tr -d ' ')" "0"
+# empty-string check, not `wc -l`: `print -r -- ""` emits one newline, so wc counted an
+# empty capture as 1 line and this check failed on a silent shell (false red, 2026-10-31).
+ck "G2 probe shell: no title emitted" "$( [[ -z "$outg2" ]] && echo EMPTY || print -r -- "$outg2" )" "EMPTY"
 
 # ---------------------------------------------------------------------------------------
 print "A. launch refused only when THIS tab's window is really gone (checked at wait end)"
@@ -140,7 +142,8 @@ kill $SUP 2>/dev/null
 
 # ---------------------------------------------------------------------------------------
 print "C. hook wiring and the empty-tab line"
-ck "hook passes --epoch only for a warp-… run id" "$(grep -c '"\$bootid" == warp-\*' "$HOOK")" "1"
+# 2 as of 2026-10-31: the lock-sweep guard (a numeric boot id must not delete warp-* locks)
+ck "hook gates epoch-keyed actions on a warp-… run id" "$(grep -c '"\$bootid" == warp-\*' "$HOOK")" "2"
 ck "hook's epoch-wait line carries --epoch"        "$(grep -c 'wait-slot --epoch' "$HOOK")" "1"
 SID2=22222222-3333-4444-5555-666666666666
 print '{"type":"ai-title","aiTitle":"warm 100%F{red} outreach %~"}' > "$TMP/.claude/projects/-tmp/$SID2.jsonl"

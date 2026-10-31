@@ -53,6 +53,10 @@ ck "returns empty, no resume" "$r" ""
 
 print "deliberate quit prunes history (SC4)"
 mktranscript $MAXSID
+# an EMPTY peer registry (~/.claude/sessions) — the case this block means: no live twin.
+# Without the dir, _sid_live_elsewhere fails toward "live" (correct, conservative) and
+# the quit processing legitimately skips.
+mkdir -p "$TMP/.claude/sessions"
 print "/tmp\t$MAXSID" > "$TMP/.superset-recovery/warp-bindings/$PANE"
 r=$(env HOME=$TMP python3 "$LIB" resolve-warp $PANE 2>/dev/null | tail -1)
 # now the user quits MAXSID deliberately (empty sessions dir = no live twin)
@@ -68,13 +72,29 @@ SNAP="$TMP/hook.snap"; cp "$HOOK" "$SNAP"
 python3 - "$HOOK" "$TMP/m1.py" <<'PY'
 import sys; s=open(sys.argv[1]).read()
 a='prev = prev[:10]'
-assert a in s, "pattern missing"
+# EXACTLY ONE match required: 2026-10-31 red team — 613c4b0 duplicated the cap line,
+# replace(...,1) silently mutated the copy this test never exercised, and the suite
+# reported a false FAIL (then a false pass for a real regression). One writer, one cap.
+assert s.count(a) == 1, "expected exactly one cap line, found %d — fix the duplication" % s.count(a)
 open(sys.argv[2],"w").write(s.replace(a,'prev = prev[:1]',1))   # cap collapses history to nothing
 PY
 rm -rf "$TMP/.superset-recovery/warp-history"; fire2() { print -r -- "$2" | env HOME=$TMP TERM_PROGRAM=WarpTerminal WARP_TERMINAL_SESSION_UUID=$PANE python3 "$1"; }
 fire2 "$TMP/m1.py" '{"hook_event_name":"SessionStart","session_id":"11111111-2222-3333-4444-555555555555","cwd":"/tmp"}'
 fire2 "$TMP/m1.py" '{"hook_event_name":"SessionStart","session_id":"99999999-8888-7777-6666-555555555555","cwd":"/tmp"}'
 ck "cap=1 mutant caught (eviction)" "$(wc -l < $H | tr -d ' ')" "1"   # healthy impl keeps 2
+# and the SUPPRESSED-branch cap: the stale path shares the single _append_history writer
+# now, so one cap mutant covers both callers (2026-10-31 red team: the duplicated cap
+# let 11 tool children evict BOTH the real and the suppressed session from the record).
+rm -rf "$TMP/.superset-recovery/warp-history"
+python3 - "$HOOK" "$TMP/m2.py" <<'PY'
+import sys; s=open(sys.argv[1]).read()
+a='prev = prev[:10]'
+assert s.count(a) == 1
+open(sys.argv[2],"w").write(s.replace(a,'prev = prev[:1]',1))
+PY
+fire2 "$TMP/m2.py" '{"hook_event_name":"SessionStart","session_id":"11111111-2222-3333-4444-555555555555","cwd":"/tmp"}'
+fire2 "$TMP/m2.py" '{"hook_event_name":"SessionStart","session_id":"99999999-8888-7777-6666-555555555555","cwd":"/tmp"}'
+ck "shared cap mutant caught on mainline" "$(wc -l < $H | tr -d ' ')" "1"
 
 print ""; print "$pass passed, $fail failed"; [[ $fail -eq 0 ]]
 
