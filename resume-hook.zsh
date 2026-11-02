@@ -132,6 +132,24 @@ if [[ -o interactive ]] && (( ! _pane_resume_probe_shell )) \
     (( ${precmd_functions[(I)_pane_resume_set_title]} )) \
       || precmd_functions+=(_pane_resume_set_title)
     _pane_resume_set_title
+
+    # ── LAYOUT SNAPSHOT (2026-11-02, owner-approved) ─────────────────────────────
+    # Our own record of Warp's tabs + groups + conversations, so a battery death can be
+    # rebuilt. Runs from INSIDE a Warp tab because macOS privacy protection denies a
+    # LaunchAgent any read of Warp's data (probed 2026-11-02: launchd -> "authorization
+    # denied"; a tab's processes inherit Warp's access). Fires at most every ~3 min
+    # machine-wide (the recorder's own stamp; --if-due costs one stat), detached so no
+    # prompt ever waits on a 73 MB sqlite read, and it can never break a shell: any
+    # failure is swallowed by the recorder itself, and this line only spawns it.
+    _pane_resume_layout_snapshot() {
+      local r="$HOME/.superset-recovery/warp-layout-recorder.py"
+      [[ -f "$r" ]] || return 0
+      { command python3 "$r" --if-due >/dev/null 2>&1 &! } 2>/dev/null
+      return 0
+    }
+    typeset -ga precmd_functions
+    (( ${precmd_functions[(I)_pane_resume_layout_snapshot]} )) \
+      || precmd_functions+=(_pane_resume_layout_snapshot)
   }
 fi
 

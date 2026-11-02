@@ -336,3 +336,14 @@ if __name__ == "__main__":
         main()
     except Exception:
         pass   # a binding-hook failure must never disrupt the claude session
+    # Layout snapshot (2026-11-02, owner-approved): a conversation just started or ended,
+    # which is exactly when the layout changed. Detached, throttled to one real run per
+    # 3 min machine-wide by the recorder itself; --if-due costs one stat() otherwise.
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          "warp-layout-recorder.py"), "--if-due"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass

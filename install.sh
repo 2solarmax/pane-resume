@@ -13,7 +13,8 @@ END="# <<< superset-recovery <<<"
 echo "Installing pane-resume → $DEST"
 mkdir -p "$DEST"
 FILES=(resume-lib.py resume-hook.zsh superset-resume warp-session-hook.py
-       pane-title.py titlelib.py restore-plan restore-in-place sess)
+       pane-title.py titlelib.py restore-plan restore-in-place sess
+       warp-layout-recorder.py warp-layout-restore)
 
 # Check EVERY file parses before copying ANY of them. This directory is sourced and imported
 # by every live shell on the machine — installing a file with a syntax error breaks every new
@@ -38,7 +39,18 @@ for f in "${FILES[@]}"; do
 done
 # titlelib is imported by the others, not run, so it stays non-executable on purpose.
 chmod +x "$DEST/superset-resume" "$DEST/resume-lib.py" "$DEST/warp-session-hook.py" \
-         "$DEST/pane-title.py" "$DEST/restore-plan" "$DEST/restore-in-place" "$DEST/sess"
+         "$DEST/pane-title.py" "$DEST/restore-plan" "$DEST/restore-in-place" "$DEST/sess" \
+         "$DEST/warp-layout-recorder.py" "$DEST/warp-layout-restore"
+
+# Layout recorder: our own copy of Warp's tabs + groups + conversations, so a battery
+# death can be rebuilt (Warp keeps only its current layout, no history). It runs from
+# inside Warp tabs (prompt hook + session hook), never as a LaunchAgent: macOS privacy
+# protection denies a background job any read of Warp's data (probed 2026-11-02).
+# Remove a LaunchAgent an earlier install may have left behind.
+LABEL="com.maxkrasnykh.pane-resume.recorder"
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/$LABEL.plist"
+echo "Layout recorder: runs from Warp tabs, at most every 3 min → $DEST/layout-snapshots/current.json"
 
 # Wire ~/.zshrc (idempotent: replace an existing managed block, else append).
 BLOCK="$BEGIN
