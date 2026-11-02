@@ -120,3 +120,16 @@ if __name__ == "__main__":
         main()
     except Exception:
         pass
+    # Layout snapshot (2026-11-02): this hook runs on every message in every tab, so it is
+    # the trigger that keeps the record fresh on a day when every tab holds one long
+    # session (the shell prompt hook never fires inside a running agent). Detached and
+    # throttled machine-wide by the recorder; costs one stat() when not due.
+    try:
+        import subprocess, sys as _sys
+        subprocess.Popen(
+            [_sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "warp-layout-recorder.py"), "--if-due"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
