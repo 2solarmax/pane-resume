@@ -298,6 +298,17 @@ if [[ -o interactive ]] \
       (( _young )) && return 0
       command mkdir -p "$recov/locks/$bootid" 2>/dev/null
       : > "$_lf" 2>/dev/null || return 0
+      # AUTOMATIC RESTORE (owner 2026-11-02: "I don't want to run anything"). The same
+      # once-per-run moment that writes the report also reopens what the record says was
+      # open and nothing has brought back — detached, so the pane never waits. Guarded
+      # inside warp-layout-restore itself: it rechecks liveness before EVERY open and
+      # opens nothing at all when it cannot tell what is live. The 30s settle delay lets
+      # the slowest restored tabs finish claiming their conversations first, so the
+      # reopen set is the true delta, not panes still starting.
+      if [[ -x "$recov/warp-layout-restore" ]]; then
+        ( sleep 30 && command "$recov/warp-layout-restore" --open --auto ) >/dev/null 2>&1 &!
+        print -r -- "$(command date '+%F %T') AUTO-RESTORE armed (warp-layout-restore --open --auto in 30s)" >> "$log" 2>/dev/null
+      fi
       command python3 "$lib" warp-report 48 >"$recov/last-report.txt" 2>/dev/null
       _n="$(head -1 "$recov/last-report.txt" 2>/dev/null)"
       [[ -n "$_n" ]] && print -r -- "$(command date '+%F %T') REPORT ${_n#\# } -> $recov/last-report.txt" >> "$log" 2>/dev/null

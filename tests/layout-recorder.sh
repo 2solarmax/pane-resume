@@ -183,6 +183,62 @@ for _ in range(3):
 sys.exit(1 if os.path.exists(d+"/.claim-attempts") else 0)
 PY
 
+# ---- 8) AUTO mode: transient probe failure retries and then opens ----------------
+# Tests 6/7 left an EMPTY snapshot behind (their stub recorder writes windows=[]), so
+# re-seed one recorded-but-missing conversation for the auto tests to restore.
+python3 - "$box/home/.superset-recovery/layout-snapshots/current.json" "$proj" <<'PY'
+import json,sys
+snap={"ts":"t","windows":[{"id":1,"groups":[],"tabs":[{"id":1,"window_id":1,"title":None,
+  "color":None,"group_id":None,"pinned":False,
+  "panes":[{"uuid":"e"*32,"cwd":sys.argv[2],"session":"66666666-6666-6666-6666-666666666666"}]}]}]}
+json.dump(snap,open(sys.argv[1],"w"))
+PY
+cat > "$box/home/.superset-recovery/resume-lib.py" <<'PY'
+import sys,os
+a=sys.argv
+C=os.path.join(os.environ["HOME"],".probe-count")
+n=int(open(C).read()) if os.path.exists(C) else 0
+open(C,"w").write(str(n+1))
+if a[1]=="label": print("Conv "+a[2][:8]); sys.exit(0)
+if n<2: sys.exit(3)          # first two liveness probes fail (restore wave still starting)
+print(0)
+PY
+rm -f "$box/opened.log" "$box/home/.probe-count"(N) "$box/home/.warp/tab_configs/"*.toml(N)
+python3 - "$box" "$repo" <<'PY' && ok "auto mode: retries a transient probe failure, then opens" || bad "auto mode gave up or opened wrongly"
+import os,subprocess,sys
+box,repo=sys.argv[1],sys.argv[2]
+src=open(repo+"/warp-layout-restore").read().replace("sys.executable","sys.executable")
+src=src.replace("for wait in (20, 40, 60):","for wait in (0, 0, 0):")
+open(box+"/wl-auto.py","w").write(src)
+env={**os.environ,"HOME":box+"/home","PATH":box+"/bin:"+os.environ["PATH"]}
+r=subprocess.run([sys.executable,box+"/wl-auto.py","--open","--auto"],capture_output=True,text=True,env=env)
+import os as _o
+if _o.environ.get("LAYOUT_TEST_DEBUG"): print("DBG rc",r.returncode,"| out:",r.stdout[-200:].replace(chr(10)," "),"| err:",r.stderr[-300:])
+opened=os.path.exists(box+"/opened.log")
+alog=os.path.exists(box+"/home/.superset-recovery/auto-restore.log")
+sys.exit(0 if (opened and alog and r.returncode==0) else 1)
+PY
+
+# ---- 9) AUTO mode: a probe that never settles opens NOTHING ----------------------
+cat > "$box/home/.superset-recovery/resume-lib.py" <<'PY'
+import sys
+a=sys.argv
+if a[1]=="label": print("Conv "+a[2][:8]); sys.exit(0)
+sys.exit(3)
+PY
+rm -f "$box/opened.log"(N)
+python3 - "$box" "$repo" <<'PY' && ok "auto mode: unsettled probe -> nothing opened, logged, non-zero" || bad "auto mode opened despite an unsettled probe"
+import os,subprocess,sys
+box,repo=sys.argv[1],sys.argv[2]
+src=open(repo+"/warp-layout-restore").read().replace("for wait in (20, 40, 60):","for wait in (0, 0, 0):")
+open(box+"/wl-auto2.py","w").write(src)
+env={**os.environ,"HOME":box+"/home","PATH":box+"/bin:"+os.environ["PATH"]}
+r=subprocess.run([sys.executable,box+"/wl-auto2.py","--open","--auto"],capture_output=True,text=True,env=env)
+opened=os.path.exists(box+"/opened.log")
+logged=os.path.exists(box+"/home/.superset-recovery/auto-restore.log")
+sys.exit(0 if ((not opened) and logged and r.returncode!=0) else 1)
+PY
+
 rm -rf "$box" "$proj"
 echo "result: $((tests - fails)) passed, $fails failed"
 exit $(( fails > 0 ))

@@ -54,6 +54,24 @@ env HOME="$box/home" zsh "$box/run.zsh" >/dev/null 2>&1
 
 [[ -e "$box/home/.superset-recovery/locks/warp-test/.report-stamp" ]] \
   && ok "stamp created" || bad "stamp not created"
+# The hook must also arm the AUTOMATIC restore (owner 2026-11-02: nothing manual). A
+# stub warp-layout-restore records the call; the 30s settle delay is stubbed away.
+printf '#!/bin/sh\necho "auto $*" >> "$HOME/.auto-fired"\n' > "$box/home/.superset-recovery/warp-layout-restore"
+chmod +x "$box/home/.superset-recovery/warp-layout-restore"
+mkdir -p "$box/bin"
+printf '#!/bin/sh\nexit 0\n' > "$box/bin/sleep"
+chmod +x "$box/bin/sleep"
+rm -f "$box/home/.superset-recovery/locks/warp-test/.report-stamp" "$box/home/.auto-fired"
+env HOME="$box/home" PATH="$box/bin:$PATH" zsh "$box/run.zsh" >/dev/null 2>&1
+# The spawn is async; the stubbed sleep makes the subshell's command run immediately,
+# but the shell still needs a moment to fork. Poll briefly rather than assert instantly.
+_auto_seen=0
+for _i in 1 2 3 4 5 6 7 8 9 10; do
+  [[ -s "$box/home/.auto-fired" ]] && { _auto_seen=1; break; }
+  command sleep 0.3 2>/dev/null || break
+done
+(( _auto_seen )) && grep -q -- "--open --auto" "$box/home/.auto-fired" \
+  && ok "auto-restore armed with --open --auto" || bad "auto-restore not armed by the hook"
 [[ -s "$box/home/.superset-recovery/last-report.txt" ]] \
   && ok "last-report.txt written (the 790137d defect: stamp yes, report MISSING)" \
   || bad "last-report.txt MISSING — stamp-without-report is the exact 2026-10-31 defect"
